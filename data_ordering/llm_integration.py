@@ -66,6 +66,9 @@ class PathAnalysis:
     Result of LLM analysis for a DIRECTORY PATH only.
     No filenames used - purely from the path structure.
     """
+    # Macroclass (top-level category)
+    macroclass: Optional[str] = None  # e.g., "Botany", "Arthropoda", "Pisces"
+    
     # Taxonomic classification (scientific name)
     taxonomic_class: Optional[str] = None  # e.g., "Mollusca", "Insecta", "Crustacea"
     
@@ -92,6 +95,7 @@ class PathAnalysis:
     
     def to_dict(self) -> dict:
         return {
+            'macroclass': self.macroclass,
             'taxonomic_class': self.taxonomic_class,
             'genus': self.genus,
             'campaign_year': self.campaign_year,
@@ -104,6 +108,7 @@ class PathAnalysis:
     @classmethod
     def from_dict(cls, data: dict) -> 'PathAnalysis':
         return cls(
+            macroclass=data.get('macroclass'),
             taxonomic_class=data.get('taxonomic_class'),
             genus=data.get('genus'),
             campaign_year=data.get('campaign_year'),
@@ -336,16 +341,7 @@ IMPORTANT RULES:
 === CAMPAIGN YEARS ===
 Look for 4-digit years (2018, 2019, 2020, etc.) in path.
 
-Respond with JSON:
-{
-    "macroclass": "Botany|Arthropoda|Mollusca_y_Vermes|Pisces|Tetrapoda|Ichnofossils|null",
-    "taxonomic_class": "biological taxonomic class in Latin, or null",
-    "genus": "most specific determination below class level, or null",
-    "campaign_year": year as integer or null,
-    "specimen_id": "specimen ID if directly visible in path or null",
-    "collection_code": "LH|BUE|MON|unknown",
-    "confidence": 0.0 to 1.0
-}"""
+The output schema is enforced automatically. Fill each field based on the rules above."""
 
 
 FILENAME_REGEX_PROMPT = """You are an expert at creating regex patterns for parsing fossil specimen filenames.
@@ -370,15 +366,7 @@ REGEX GUIDELINES:
 - Handle optional plate indicators: (?P<plate>[ab])?
 - Example: r"(?P<specimen_id>LH[-\\s]?\\d{3,8})(?:\\s*(?P<plate>[ab]))?"
 
-Respond with JSON:
-{
-    "master_regex": "Single regex with all named groups, or null if not possible",
-    "specimen_id_regex": "Regex for specimen ID only (with capture group)",
-    "campaign_year_regex": "Regex for year extraction, or null",
-    "extractable_fields": ["specimen_id", "plate", ...list of what can be extracted],
-    "confidence": 0.0 to 1.0,
-    "notes": "Any important notes about the patterns"
-}"""
+The output schema is enforced automatically. Fill each field based on the guidelines above."""
 
 
 FILE_ANALYSIS_PROMPT = """You are an expert paleontologist. Extract information from this single fossil image filename.
@@ -391,16 +379,185 @@ SPECIMEN ID FORMATS:
 - "K-Bue 123" (Buenache)
 - Numeric sequences that look like specimen IDs (not camera numbers like DSC00001)
 
-Respond with JSON:
-{
-    "specimen_id": "extracted specimen ID or null",
-    "campaign_year": year as integer or null,
-    "taxonomic_class": "if encoded in filename or null",
-    "genus": "if encoded in filename or null",
-    "collection_code": "LH|BUE|MON|unknown",
-    "confidence": 0.0 to 1.0,
-    "is_camera_generated": true/false (if filename looks like DSC00001, IMG_1234, etc.)
-}"""
+The output schema is enforced automatically. Fill each field based on the formats above."""
+
+
+# =============================================================================
+# STRUCTURED OUTPUT SCHEMAS
+# =============================================================================
+# These schemas enforce the exact JSON shape for each stage.
+# Stored in Gemini-native format ("nullable": true for optional fields).
+# GitHubModelsClient transforms them to OpenAI format at call time:
+#   - "nullable": true  →  "anyOf": [{"type": T}, {"type": "null"}]
+#   - Injects "additionalProperties": false (required by OpenAI strict mode)
+
+PATH_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "macroclass": {
+            "type": "string",
+            "nullable": True,
+            "enum": ["Botany", "Arthropoda", "Mollusca_y_Vermes", "Pisces", "Tetrapoda", "Ichnofossils"],
+            "description": "Top-level category. Botany=plants/algae, Arthropoda=insects/crustaceans/arachnids, Mollusca_y_Vermes=mollusks/worms, Pisces=fish, Tetrapoda=amphibians/reptiles/birds/mammals, Ichnofossils=trace fossils. Null if undetermined."
+        },
+        "taxonomic_class": {
+            "type": "string",
+            "nullable": True,
+            "description": "Biological taxonomic class in scientific Latin (e.g. Insecta, Malacostraca, Bivalvia, Actinopterygii, Reptilia). Translate Spanish terms to Latin. Must differ from macroclass. Null if only macroclass is determinable."
+        },
+        "genus": {
+            "type": "string",
+            "nullable": True,
+            "description": "Most specific taxonomic determination below class level (order, family, genus, or species). Must differ from both macroclass and taxonomic_class. Null if nothing below class is determinable."
+        },
+        "campaign_year": {
+            "type": "integer",
+            "nullable": True,
+            "description": "4-digit campaign/excavation year (e.g. 2018, 2019) if present in the directory path. Null otherwise."
+        },
+        "specimen_id": {
+            "type": "string",
+            "nullable": True,
+            "description": "Specimen identifier if directly visible in the directory path (e.g. LH-12345). Null if not present in path."
+        },
+        "collection_code": {
+            "type": "string",
+            "enum": ["LH", "BUE", "MON", "unknown"],
+            "description": "Collection site: LH=Las Hoyas, BUE=Buenache, MON=Montsec. Use 'unknown' if not determinable."
+        },
+        "confidence": {
+            "type": "number",
+            "description": "Confidence in the overall analysis from 0.0 to 1.0"
+        }
+    },
+    "required": ["macroclass", "taxonomic_class", "genus", "campaign_year", "specimen_id", "collection_code", "confidence"],
+}
+
+FILENAME_REGEX_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "master_regex": {
+            "type": "string",
+            "nullable": True,
+            "description": "Single Python regex with named groups (?P<name>...) to extract all fields at once. Use [-\\s]? for flexible separators. Null if a single pattern is not feasible."
+        },
+        "specimen_id_regex": {
+            "type": "string",
+            "nullable": True,
+            "description": "Python regex with a capture group to extract specimen ID only. E.g. r'(LH[-\\s]?\\d{3,8})' or r'(K-Bue[-\\s]?\\d+)'. Null if specimen ID is not extractable."
+        },
+        "campaign_year_regex": {
+            "type": "string",
+            "nullable": True,
+            "description": "Python regex to extract a 4-digit campaign year from filenames. Null if year is not encoded in filenames."
+        },
+        "extractable_fields": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of field names that can be extracted from these filenames (e.g. 'specimen_id', 'plate', 'campaign_year')"
+        },
+        "confidence": {
+            "type": "number",
+            "description": "Confidence in the regex patterns from 0.0 to 1.0"
+        },
+        "notes": {
+            "type": "string",
+            "nullable": True,
+            "description": "Any important notes about the filename patterns or edge cases"
+        }
+    },
+    "required": ["master_regex", "specimen_id_regex", "campaign_year_regex", "extractable_fields", "confidence", "notes"],
+}
+
+FILE_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "specimen_id": {
+            "type": "string",
+            "nullable": True,
+            "description": "Extracted specimen ID. Formats: 'LH 12345', 'LH-12345' (Las Hoyas), 'MUPA 12345678' (museum), 'K-Bue 123' (Buenache). Null if not identifiable."
+        },
+        "campaign_year": {
+            "type": "integer",
+            "nullable": True,
+            "description": "4-digit campaign year if encoded in the filename. Null otherwise."
+        },
+        "taxonomic_class": {
+            "type": "string",
+            "nullable": True,
+            "description": "Taxonomic class in scientific Latin if encoded in the filename. Null otherwise."
+        },
+        "genus": {
+            "type": "string",
+            "nullable": True,
+            "description": "Genus or more specific determination if encoded in the filename. Null otherwise."
+        },
+        "collection_code": {
+            "type": "string",
+            "enum": ["LH", "BUE", "MON", "unknown"],
+            "description": "Collection site: LH=Las Hoyas, BUE=Buenache, MON=Montsec. Use 'unknown' if not determinable."
+        },
+        "confidence": {
+            "type": "number",
+            "description": "Confidence in the analysis from 0.0 to 1.0"
+        },
+        "is_camera_generated": {
+            "type": "boolean",
+            "description": "True if filename looks auto-generated by a camera (e.g. DSC00001, IMG_1234, DSCN0001). False otherwise."
+        }
+    },
+    "required": ["specimen_id", "campaign_year", "taxonomic_class", "genus", "collection_code", "confidence", "is_camera_generated"],
+}
+
+# Map schema names to schema objects for lookup
+_SCHEMAS = {
+    "path_analysis": PATH_ANALYSIS_SCHEMA,
+    "filename_regex": FILENAME_REGEX_SCHEMA,
+    "file_analysis": FILE_ANALYSIS_SCHEMA,
+}
+
+
+def _schema_to_openai(schema: dict) -> dict:
+    """Transform a Gemini-native schema to OpenAI strict-mode format.
+    
+    Conversions:
+      - {"type": T, "nullable": true, ...}  →  {"anyOf": [{"type": T, ...}, {"type": "null"}]}
+      - Injects "additionalProperties": false on every object
+      - Recurses into nested objects and array items
+    """
+    import copy
+    schema = copy.deepcopy(schema)
+    return _convert_node(schema)
+
+
+def _convert_node(node: dict) -> dict:
+    """Recursively convert a single schema node."""
+    if not isinstance(node, dict):
+        return node
+    
+    node_type = node.get("type")
+    
+    # Handle nullable fields: pull out "nullable" and wrap in anyOf
+    if node.pop("nullable", False):
+        # Build the non-null branch (everything except nullable)
+        non_null = {k: v for k, v in node.items()}
+        non_null = _convert_node(non_null)
+        return {"anyOf": [non_null, {"type": "null"}]}
+    
+    # Handle objects: recurse into properties, add additionalProperties
+    if node_type == "object":
+        node["additionalProperties"] = False
+        if "properties" in node:
+            node["properties"] = {
+                k: _convert_node(v)
+                for k, v in node["properties"].items()
+            }
+    
+    # Handle arrays: recurse into items
+    if node_type == "array" and "items" in node:
+        node["items"] = _convert_node(node["items"])
+    
+    return node
 
 
 # =============================================================================
@@ -413,26 +570,41 @@ class BaseLLMClient:
     def __init__(self, requests_per_minute: int = 15):
         self.rate_limiter = RateLimiter(requests_per_minute)
     
-    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
-        """Override in subclasses. Returns raw response text."""
+    def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
+        """Override in subclasses. Returns raw response text.
+        
+        Args:
+            system_prompt: The system/instruction prompt
+            user_prompt: The user query
+            schema_name: Key into _SCHEMAS dict to enforce structured output.
+                         One of: 'path_analysis', 'filename_regex', 'file_analysis'.
+        """
         raise NotImplementedError
     
     def _parse_json(self, response_text: str) -> dict:
-        """Parse JSON from response, handling markdown code blocks."""
+        """Parse JSON from response.
+        
+        With structured outputs enabled, the response is guaranteed to be valid
+        JSON matching the schema. We still keep a fallback for markdown-wrapped
+        responses in case a provider doesn't support structured outputs.
+        """
         try:
+            return json.loads(response_text.strip())
+        except json.JSONDecodeError:
+            # Fallback: strip markdown code fences if present
             json_text = response_text
-            if '```json' in response_text:
-                json_text = response_text.split('```json')[1].split('```')[0]
-            elif '```' in response_text:
-                parts = response_text.split('```')
-                if len(parts) >= 2:
-                    json_text = parts[1]
-            
-            return json.loads(json_text.strip())
-        except (json.JSONDecodeError, IndexError) as e:
-            logger.error(f"Failed to parse JSON: {e}")
-            logger.error(f"Response was: {response_text}")
-            return {}
+            try:
+                if '```json' in response_text:
+                    json_text = response_text.split('```json')[1].split('```')[0]
+                elif '```' in response_text:
+                    parts = response_text.split('```')
+                    if len(parts) >= 2:
+                        json_text = parts[1]
+                return json.loads(json_text.strip())
+            except (json.JSONDecodeError, IndexError) as e:
+                logger.error(f"Failed to parse JSON: {e}")
+                logger.error(f"Response was: {response_text[:500]}")
+                return {}
     
     # -------------------------------------------------------------------------
     # STAGE 1: Path Analysis
@@ -458,10 +630,11 @@ Extract any taxonomic, collection, or campaign information visible in the path s
 Remember to convert Spanish taxonomic terms to scientific names."""
 
         try:
-            response_text = self._call_api(PATH_ANALYSIS_PROMPT, user_prompt)
+            response_text = self._call_api(PATH_ANALYSIS_PROMPT, user_prompt, schema_name='path_analysis')
             data = self._parse_json(response_text)
             
             return PathAnalysis(
+                macroclass=data.get('macroclass'),
                 taxonomic_class=data.get('taxonomic_class'),
                 genus=data.get('genus'),
                 campaign_year=data.get('campaign_year'),
@@ -514,7 +687,7 @@ Create regex patterns with named groups to extract specimen_id, year, and plate 
             user_prompt += f"\n\n{refinement_context}"
 
         try:
-            response_text = self._call_api(FILENAME_REGEX_PROMPT, user_prompt)
+            response_text = self._call_api(FILENAME_REGEX_PROMPT, user_prompt, schema_name='filename_regex')
             data = self._parse_json(response_text)
             
             return FilenameRegexResult(
@@ -643,7 +816,7 @@ Filename: {filename}
 Extract any specimen ID, year, or taxonomic information encoded in the filename."""
 
         try:
-            response_text = self._call_api(FILE_ANALYSIS_PROMPT, user_prompt)
+            response_text = self._call_api(FILE_ANALYSIS_PROMPT, user_prompt, schema_name='file_analysis')
             data = self._parse_json(response_text)
             
             return FileAnalysis(
@@ -823,18 +996,47 @@ class GitHubModelsClient(BaseLLMClient):
         
         logger.info(f"Initialized GitHub Models client with model {self.model_name}")
     
-    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
-        """Make API call and return response text."""
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=1024,
-            response_format={"type": "json_object"},
-        )
+    def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
+        """Make API call with structured output enforcement.
+        
+        Uses OpenAI Structured Outputs (json_schema with strict: true) when a
+        schema_name is provided, guaranteeing the response matches the schema.
+        Falls back to basic json_object mode if no schema is given.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        if schema_name and schema_name in _SCHEMAS:
+            # Transform Gemini-native schema to OpenAI strict format:
+            #   - "nullable": true  →  "anyOf": [{"type": T, ...}, {"type": "null"}]
+            #   - inject "additionalProperties": false (required by strict mode)
+            schema = _schema_to_openai(_SCHEMAS[schema_name])
+            
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    }
+                },
+            )
+        else:
+            # Fallback for calls without a defined schema
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
         
         return response.choices[0].message.content
 
@@ -872,17 +1074,27 @@ class GeminiClient(BaseLLMClient):
         
         logger.info(f"Initialized Gemini client with model {self.model_name}")
     
-    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
-        """Make API call and return response text."""
+    def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
+        """Make API call with structured output enforcement.
+        
+        Uses Gemini's response_schema parameter when a schema_name is provided,
+        guaranteeing the response matches the schema. Falls back to basic
+        application/json mode if no schema is given.
+        """
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        
+        gen_config_kwargs = {
+            "temperature": 0.1,
+            "max_output_tokens": 1024,
+            "response_mime_type": "application/json",
+        }
+        
+        if schema_name and schema_name in _SCHEMAS:
+            gen_config_kwargs["response_schema"] = _SCHEMAS[schema_name]
         
         response = self.model.generate_content(
             full_prompt,
-            generation_config=GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=1024,
-                response_mime_type="application/json",
-            )
+            generation_config=GenerationConfig(**gen_config_kwargs)
         )
         
         return response.text
@@ -902,7 +1114,7 @@ class MockLLMClient(BaseLLMClient):
     def __init__(self):
         super().__init__(requests_per_minute=1000)  # No real limiting
     
-    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+    def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
         """Return mock responses based on content."""
         user_lower = user_prompt.lower()
         

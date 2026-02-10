@@ -20,9 +20,9 @@
             "module": "data_ordering.cli",
             "args": [
                 "--source",
-                "D:\\test_source\\LH",
+                "C:\\test_source\\LH",
                 "--output",
-                "D:\\clean_dataset",
+                "C:\\clean_dataset",
                 "--step-by-step",
                 "--use-llm"
             ],

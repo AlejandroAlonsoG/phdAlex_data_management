@@ -680,6 +680,7 @@ class PipelineOrchestrator:
                 client = self.directory_analyzer.client
                 path_analysis = client.analyze_path(Path(dir_path))
                 
+                print(f"       Macroclass: {path_analysis.macroclass or 'None'}")
                 print(f"       Taxonomic class: {path_analysis.taxonomic_class or 'None'}")
                 print(f"       Genus/Order: {path_analysis.genus or 'None'}")
                 print(f"       Collection: {path_analysis.collection_code or 'unknown'}")
@@ -789,6 +790,7 @@ class PipelineOrchestrator:
             # Build combined DirectoryAnalysis for backwards compatibility
             analysis_dict = {
                 'directory_path': dir_path,
+                'macroclass': path_analysis.macroclass if path_analysis else None,
                 'taxonomic_class': path_analysis.taxonomic_class if path_analysis else None,
                 'determination': path_analysis.genus if path_analysis else None,
                 'collection_code': path_analysis.collection_code if path_analysis else 'unknown',
@@ -811,6 +813,8 @@ class PipelineOrchestrator:
                 
                 # Apply path-level metadata
                 if path_analysis:
+                    if path_analysis.macroclass:
+                        pf_data['macroclass'] = path_analysis.macroclass
                     if path_analysis.taxonomic_class:
                         pf_data['taxonomic_class'] = path_analysis.taxonomic_class
                     if path_analysis.genus:
