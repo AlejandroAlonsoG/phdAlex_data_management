@@ -1003,6 +1003,8 @@ class GitHubModelsClient(BaseLLMClient):
         schema_name is provided, guaranteeing the response matches the schema.
         Falls back to basic json_object mode if no schema is given.
         """
+        logger.debug(f"[LLM_REQUEST] schema={schema_name} | prompt={user_prompt[:300]}")
+        
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -1038,7 +1040,9 @@ class GitHubModelsClient(BaseLLMClient):
                 response_format={"type": "json_object"},
             )
         
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        logger.debug(f"[LLM_RESPONSE] schema={schema_name} | response={result[:500]}")
+        return result
 
 
 # =============================================================================
@@ -1081,6 +1085,8 @@ class GeminiClient(BaseLLMClient):
         guaranteeing the response matches the schema. Falls back to basic
         application/json mode if no schema is given.
         """
+        logger.debug(f"[LLM_REQUEST] schema={schema_name} | prompt={user_prompt[:300]}")
+        
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
         
         gen_config_kwargs = {
@@ -1097,7 +1103,9 @@ class GeminiClient(BaseLLMClient):
             generation_config=GenerationConfig(**gen_config_kwargs)
         )
         
-        return response.text
+        result = response.text
+        logger.debug(f"[LLM_RESPONSE] schema={schema_name} | response={result[:500]}")
+        return result
 
 
 # =============================================================================

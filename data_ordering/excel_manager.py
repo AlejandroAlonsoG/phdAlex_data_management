@@ -20,11 +20,9 @@ class ImageRecord:
     macroclass_label: Optional[str] = None
     class_label: Optional[str] = None
     genera_label: Optional[str] = None
-    fecha_captura: Optional[str] = None  # YYYYMMDD format
     campaign_year: Optional[str] = None
     fuente: Optional[str] = None  # MUPA, YCLH, etc.
     comentarios: Optional[str] = None
-    hash_perceptual: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     
     @staticmethod
@@ -61,7 +59,8 @@ class OtherFileRecord:
 class HashRecord:
     """Record for image hashes used in deduplication."""
     uuid: str
-    hash_value: str
+    md5_hash: str
+    phash: str
     file_path: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -259,25 +258,25 @@ class ExcelManager:
                 self._hash_df = pd.DataFrame(columns=columns)
         return self._hash_df
     
-    def add_hash(self, uuid: str, hash_value: str, file_path: Path):
-        """Add a hash record."""
+    def add_hash(self, uuid: str, md5_hash: str, phash: str, file_path: Path):
+        """Add a hash record with both MD5 and perceptual hash."""
         df = self._get_hash_df()
-        record = HashRecord(uuid=uuid, hash_value=hash_value, file_path=str(file_path))
+        record = HashRecord(uuid=uuid, md5_hash=md5_hash, phash=phash, file_path=str(file_path))
         new_row = pd.DataFrame([asdict(record)])
         self._hash_df = pd.concat([df, new_row], ignore_index=True)
     
-    def find_by_hash(self, hash_value: str) -> Optional[Dict]:
-        """Find a record by hash value."""
+    def find_by_hash(self, md5_hash: str) -> Optional[Dict]:
+        """Find a record by MD5 hash value."""
         df = self._get_hash_df()
-        matches = df[df['hash_value'] == hash_value]
+        matches = df[df['md5_hash'] == md5_hash]
         if len(matches) > 0:
             return matches.iloc[0].to_dict()
         return None
     
     def get_all_hashes(self) -> Dict[str, str]:
-        """Get all hashes as {hash: uuid} dictionary."""
+        """Get all hashes as {md5_hash: uuid} dictionary."""
         df = self._get_hash_df()
-        return dict(zip(df['hash_value'], df['uuid']))
+        return dict(zip(df['md5_hash'], df['uuid']))
     
     # === Save/Load ===
     
@@ -353,8 +352,8 @@ def test_excel_manager():
         assert text_id == "TXT000001"
         
         # Test hash
-        manager.add_hash(uuid1, "abc123hash", Path("/path/to/image1.jpg"))
-        found = manager.find_by_hash("abc123hash")
+        manager.add_hash(uuid1, "abc123md5", "def456phash", Path("/path/to/image1.jpg"))
+        found = manager.find_by_hash("abc123md5")
         assert found is not None
         assert found['uuid'] == uuid1
         

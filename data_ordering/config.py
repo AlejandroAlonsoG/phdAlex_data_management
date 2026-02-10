@@ -97,7 +97,7 @@ def get_macroclass(class_label: Optional[str]) -> Optional[str]:
     return CLASS_TO_MACROCLASS.get(class_label.lower().strip())
 
 
-def get_macroclass_folder(class_label: Optional[str]) -> str:
+def get_macroclass_folder(class_label: Optional[str]) -> Optional[str]:
     """
     Get the folder name for a given taxonomic class's macroclass.
     
@@ -105,12 +105,12 @@ def get_macroclass_folder(class_label: Optional[str]) -> str:
         class_label: The taxonomic class
         
     Returns:
-        Folder name (e.g., 'Arthropoda') or 'Unsorted_Macroclass' if not found
+        Folder name (e.g., 'Arthropoda') or None if not found
     """
     macro_key = get_macroclass(class_label)
     if macro_key and macro_key in MACROCLASSES:
         return MACROCLASSES[macro_key]['folder']
-    return 'Unsorted_Macroclass'
+    return None
 
 # === File extension sets ===
 IMAGE_WITH_METADATA_SUPPORT = {
@@ -164,12 +164,12 @@ COLLECTIONS = {
         prefixes=('K-BUE', 'CER-BUE', 'PB'),  # Note: PB may need disambiguation
         path_keywords=('buenache', 'bue', 'cantera'),
     ),
-    # 'montsec': CollectionConfig(  # Uncomment when Montsec collection is confirmed
-    #     name="Montsec",
-    #     code="MON",
-    #     prefixes=(),  # Add confirmed prefixes here
-    #     path_keywords=('montsec', 'monset'),
-    # ),
+    'montsec': CollectionConfig(
+        name="Montsec",
+        code="MON",
+        prefixes=(),  # Add confirmed prefixes when known
+        path_keywords=('montsec', 'monset'),
+    ),
 }
 
 # All known specimen prefixes (flat set for quick lookup)

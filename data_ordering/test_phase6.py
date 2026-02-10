@@ -13,6 +13,7 @@ from data_ordering.main_orchestrator import (
     PipelineOrchestrator, PipelineState, PipelineStage,
     ProcessedFile, run_pipeline
 )
+from data_ordering.merge_output import OutputMerger
 from data_ordering.file_utils import FileType
 
 
@@ -161,7 +162,8 @@ def test_pipeline_dry_run():
             output_dir=output_dir,
             use_llm=False,  # Use mock client
             dry_run=True,   # Don't actually move files
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            use_staging=False,  # Direct output for testing
         )
         
         state = orchestrator.run()
@@ -234,6 +236,7 @@ def test_pipeline_with_files():
             output_dir=output_dir,
             use_llm=False,
             dry_run=False,
+            use_staging=False,  # Direct output for testing
         )
         state = orchestrator.run()
         
@@ -299,6 +302,7 @@ def test_pipeline_resume():
             output_dir=output_dir,
             use_llm=False,
             dry_run=True,
+            use_staging=False,  # Direct output for testing
         )
         
         # Run just scanning stage
@@ -318,6 +322,7 @@ def test_pipeline_resume():
             output_dir=output_dir,
             use_llm=False,
             dry_run=True,
+            use_staging=False,  # Direct output for testing
         )
         
         state = orchestrator2.run(resume=True)
@@ -344,6 +349,254 @@ def test_pipeline_resume():
             print("  [WARN] Could not clean up temp dir")
 
 
+def test_staging_directory():
+    """Test that pipeline outputs to staging directory."""
+    print("\n" + "=" * 60)
+    print("STAGING DIRECTORY TEST")
+    print("=" * 60)
+    
+    temp_dir = Path(tempfile.mkdtemp())
+    orchestrator = None
+    
+    try:
+        source_dir = temp_dir / "source" / "MyData"
+        output_dir = temp_dir / "output"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir()
+        
+        # Create a few test files
+        (source_dir / "LH 15083.jpg").write_text("fake image 1")
+        (source_dir / "LH 15084.jpg").write_text("fake image 2")
+        
+        # Run with staging enabled (default)
+        orchestrator = PipelineOrchestrator(
+            source_dirs=[source_dir],
+            output_dir=output_dir,
+            use_llm=False,
+            dry_run=False,
+            use_staging=True,
+        )
+        
+        # Check staging dir is different from output_dir
+        expected_staging = PipelineOrchestrator.compute_staging_dir(output_dir, [source_dir])
+        assert orchestrator.output_dir == expected_staging, (
+            f"Expected staging dir {expected_staging}, got {orchestrator.output_dir}"
+        )
+        assert orchestrator.final_output_dir == output_dir
+        print(f"  Staging dir: {orchestrator.output_dir}")
+        print(f"  Final output dir: {orchestrator.final_output_dir}")
+        
+        # Run the pipeline
+        state = orchestrator.run()
+        assert state.stage == PipelineStage.COMPLETED
+        
+        # Check staging_info.json was created
+        staging_info_path = orchestrator.output_dir / "staging_info.json"
+        assert staging_info_path.exists(), "staging_info.json should exist"
+        
+        import json
+        with open(staging_info_path) as f:
+            info = json.load(f)
+        assert info['final_output_dir'] == str(output_dir)
+        print(f"  staging_info.json: final_output_dir={info['final_output_dir']}")
+        
+        # Check files are in staging dir, not in output_dir
+        staging_files = list(orchestrator.output_dir.rglob("*.jpg"))
+        output_files = list(output_dir.rglob("*.jpg"))
+        assert len(staging_files) > 0, "Files should be in staging directory"
+        print(f"  Files in staging: {len(staging_files)}")
+        print(f"  Files in output (should be 0): {len(output_files)}")
+        
+        print("\n[PASS] Staging directory test passed")
+        return True
+        
+    finally:
+        if orchestrator and orchestrator.action_logger:
+            orchestrator.action_logger.close()
+        
+        import time
+        time.sleep(0.1)
+        
+        try:
+            shutil.rmtree(temp_dir)
+        except PermissionError:
+            print("  [WARN] Could not clean up temp dir")
+
+
+def test_merge_output():
+    """Test merging staging directory into output."""
+    print("\n" + "=" * 60)
+    print("MERGE OUTPUT TEST")
+    print("=" * 60)
+    
+    temp_dir = Path(tempfile.mkdtemp())
+    orchestrator = None
+    
+    try:
+        source_dir = temp_dir / "source" / "TestData"
+        output_dir = temp_dir / "output"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir()
+        
+        # Create test files
+        sub_dir = source_dir / "Colección LH-" / "Insecta"
+        sub_dir.mkdir(parents=True)
+        (sub_dir / "LH 15083.jpg").write_text("fake image 1")
+        (sub_dir / "LH 15084.jpg").write_text("fake image 2")
+        
+        # Run pipeline with staging
+        orchestrator = PipelineOrchestrator(
+            source_dirs=[source_dir],
+            output_dir=output_dir,
+            use_llm=False,
+            dry_run=False,
+            use_staging=True,
+        )
+        state = orchestrator.run()
+        staging_dir = orchestrator.output_dir
+        
+        # Close logger before merge
+        if orchestrator.action_logger:
+            orchestrator.action_logger.close()
+        
+        print(f"  Pipeline done. Staging dir: {staging_dir}")
+        
+        # Now merge
+        merger = OutputMerger(
+            staging_dir=staging_dir,
+            dry_run=False,
+            auto_accept=True,
+        )
+        stats = merger.merge()
+        
+        print(f"\n  Merge stats: {stats}")
+        
+        # Verify files were copied to output
+        output_files = list(output_dir.rglob("*"))
+        output_file_names = [f.name for f in output_files if f.is_file()]
+        print(f"  Files in output after merge: {len([f for f in output_files if f.is_file()])}")
+        
+        assert stats['files_copied'] > 0, "Some files should have been copied"
+        assert stats['errors'] == 0, f"No errors expected, got {stats['errors']}"
+        
+        # Verify registries were copied
+        output_reg = output_dir / "registries"
+        if output_reg.exists():
+            reg_files = list(output_reg.glob("*.xlsx"))
+            print(f"  Registry files in output: {[f.name for f in reg_files]}")
+        
+        print("\n[PASS] Merge output test passed")
+        return True
+        
+    finally:
+        if orchestrator and orchestrator.action_logger:
+            orchestrator.action_logger.close()
+        
+        import time
+        time.sleep(0.1)
+        
+        try:
+            shutil.rmtree(temp_dir)
+        except PermissionError:
+            print("  [WARN] Could not clean up temp dir")
+
+
+def test_merge_with_existing():
+    """Test merging into an output that already has files."""
+    print("\n" + "=" * 60)
+    print("MERGE WITH EXISTING FILES TEST")
+    print("=" * 60)
+    
+    temp_dir = Path(tempfile.mkdtemp())
+    orchestrator = None
+    
+    try:
+        source_dir = temp_dir / "source" / "NewBatch"
+        output_dir = temp_dir / "output"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir()
+        
+        # Pre-populate output with some files
+        existing_dir = output_dir / "Campaña_2020" / "Arthropoda"
+        existing_dir.mkdir(parents=True)
+        (existing_dir / "existing_file.jpg").write_text("existing image")
+        
+        # Pre-populate registry
+        import pandas as pd
+        from data_ordering.excel_manager import ImageRecord
+        from dataclasses import asdict
+        
+        reg_dir = output_dir / "registries"
+        reg_dir.mkdir(parents=True)
+        
+        existing_record = ImageRecord(
+            uuid="existing-uuid-001",
+            specimen_id="LH 99999",
+            original_path="/old/path/existing.jpg",
+            current_path=str(existing_dir / "existing_file.jpg"),
+        )
+        df = pd.DataFrame([asdict(existing_record)])
+        df.to_excel(reg_dir / "anotaciones.xlsx", index=False)
+        
+        # Create source files
+        (source_dir / "LH 15083.jpg").write_text("new image 1")
+        
+        # Run pipeline with staging
+        orchestrator = PipelineOrchestrator(
+            source_dirs=[source_dir],
+            output_dir=output_dir,
+            use_llm=False,
+            dry_run=False,
+            use_staging=True,
+        )
+        state = orchestrator.run()
+        staging_dir = orchestrator.output_dir
+        
+        if orchestrator.action_logger:
+            orchestrator.action_logger.close()
+        
+        # Merge
+        merger = OutputMerger(
+            staging_dir=staging_dir,
+            dry_run=False,
+            auto_accept=True,
+        )
+        stats = merger.merge()
+        
+        print(f"  Merge stats: {stats}")
+        
+        # Verify existing file is still there
+        assert (existing_dir / "existing_file.jpg").exists(), "Existing file should remain"
+        
+        # Verify new files were added
+        assert stats['files_copied'] > 0
+        assert stats['errors'] == 0
+        
+        # Verify registry was merged (should have both old and new records)
+        merged_df = pd.read_excel(reg_dir / "anotaciones.xlsx")
+        print(f"  Registry records after merge: {len(merged_df)}")
+        assert len(merged_df) >= 2, f"Expected at least 2 records, got {len(merged_df)}"
+        
+        # Check existing record is preserved
+        existing_uuids = merged_df['uuid'].tolist()
+        assert "existing-uuid-001" in existing_uuids, "Existing record should be preserved"
+        
+        print("\n[PASS] Merge with existing files test passed")
+        return True
+        
+    finally:
+        if orchestrator and orchestrator.action_logger:
+            orchestrator.action_logger.close()
+        
+        import time
+        time.sleep(0.1)
+        
+        try:
+            shutil.rmtree(temp_dir)
+        except PermissionError:
+            print("  [WARN] Could not clean up temp dir")
+
+
 if __name__ == "__main__":
     print("MAIN ORCHESTRATOR TESTS")
     print("=" * 60)
@@ -356,6 +609,9 @@ if __name__ == "__main__":
     results.append(("Pipeline Dry Run", test_pipeline_dry_run()))
     results.append(("Pipeline With Files", test_pipeline_with_files()))
     results.append(("Pipeline Resume", test_pipeline_resume()))
+    results.append(("Staging Directory", test_staging_directory()))
+    results.append(("Merge Output", test_merge_output()))
+    results.append(("Merge With Existing", test_merge_with_existing()))
     
     print("\n" + "=" * 60)
     print("SUMMARY")

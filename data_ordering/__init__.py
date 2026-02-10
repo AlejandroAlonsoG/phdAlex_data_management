@@ -51,6 +51,7 @@ from .main_orchestrator import (
     PipelineOrchestrator, PipelineState, ProcessedFile, PipelineStage,
     run_pipeline
 )
+from .merge_output import OutputMerger
 
 __version__ = "0.9.0"
 __all__ = [
@@ -72,4 +73,5 @@ __all__ = [
     'DecisionRequest', 'DecisionResult',
     'PipelineOrchestrator', 'PipelineState', 'ProcessedFile', 'PipelineStage',
     'run_pipeline',
+    'OutputMerger',
 ]

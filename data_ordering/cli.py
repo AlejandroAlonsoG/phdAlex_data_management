@@ -131,6 +131,12 @@ Examples:
         help='Skip hash computation (faster but no duplicate detection)'
     )
     
+    parser.add_argument(
+        '--no-staging',
+        action='store_true',
+        help='Write directly to output directory instead of a staging directory'
+    )
+    
     # Output control
     parser.add_argument(
         '--verbose', '-v',
@@ -193,17 +199,18 @@ def print_summary(orchestrator: PipelineOrchestrator):
     print("=" * 60)
     
     print(f"\nTotal files processed: {summary['total_files']}")
-    print(f"Images: {summary['images']}")
-    print(f"With specimen ID: {summary['with_specimen_id']}")
-    print(f"Without specimen ID: {summary['without_specimen_id']}")
+    print(f"Files organized: {summary['files_organized']}")
+    print(f"Directories analyzed: {summary['directories_analyzed']}")
     print(f"Duplicates found: {summary['duplicates']}")
+    if summary['errors']:
+        print(f"Errors: {summary['errors']}")
     
     print("\nBy collection:")
     for collection, count in summary.get('by_collection', {}).items():
         print(f"  {collection}: {count}")
     
     print("\nBy class:")
-    for taxon, count in summary.get('by_class', {}).items():
+    for taxon, count in summary.get('by_taxonomic_class', {}).items():
         name = taxon if taxon else "Unclassified"
         print(f"  {name}: {count}")
     
@@ -226,7 +233,7 @@ def run_cli(args: argparse.Namespace) -> int:
     elif args.deferred:
         interaction_mode = 'deferred'
     else:
-        interaction_mode = 'auto_accept'
+        interaction_mode = 'interactive'
     
     # Create progress callback
     def progress_callback(stage: str, current: int, total: int):
@@ -249,6 +256,7 @@ def run_cli(args: argparse.Namespace) -> int:
             phash_threshold=args.phash_threshold,
             progress_callback=None if args.quiet else progress_callback,
             interaction_mode=interaction_mode,
+            use_staging=not getattr(args, 'no_staging', False),
         )
         
         # Resume or run fresh
@@ -266,6 +274,9 @@ def run_cli(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(f"\nSource directories: {[str(p) for p in (args.source or [])]}")
             print(f"Output directory: {args.output.resolve()}")
+            if not getattr(args, 'no_staging', False) and args.source:
+                print(f"Staging directory: {orchestrator.output_dir}")
+                print(f"  (Results will be written here for validation before merging)")
             print(f"Dry run: {args.dry_run}")
             print(f"Use LLM: {use_llm}")
             print(f"Interaction mode: {interaction_mode}")
@@ -275,6 +286,19 @@ def run_cli(args: argparse.Namespace) -> int:
         
         # Print summary
         print_summary(orchestrator)
+        
+        # Show merge instructions if staging was used
+        if not getattr(args, 'no_staging', False) and orchestrator.output_dir != orchestrator.final_output_dir:
+            print(f"\n{'='*60}")
+            print("NEXT STEP: VALIDATE AND MERGE")
+            print(f"{'='*60}")
+            print(f"Results are in staging directory:")
+            print(f"  {orchestrator.output_dir}")
+            print(f"\nPlease review the results, then merge into final output:")
+            print(f"  python -m data_ordering.merge_output --staging {orchestrator.output_dir}")
+            print(f"  (Final output: {orchestrator.final_output_dir})")
+            print(f"\nOr merge with explicit target:")
+            print(f"  python -m data_ordering.merge_output --staging {orchestrator.output_dir} --output {orchestrator.final_output_dir}")
         
         # Cleanup
         orchestrator.action_logger.close()

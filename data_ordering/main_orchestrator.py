@@ -30,7 +30,8 @@ from .interaction_manager import (
     InteractionManager, InteractionMode, DecisionType, DecisionOutcome,
     DecisionRequest, DecisionResult,
     create_numeric_id_decision, create_metadata_conflict_decision,
-    create_duplicate_decision, create_unknown_collection_decision
+    create_duplicate_decision, create_duplicate_metadata_decision,
+    create_unknown_collection_decision
 )
 
 
@@ -70,7 +71,6 @@ class ProcessedFile:
     taxonomic_class: Optional[str] = None  # Insecta, Osteichthyes, etc.
     determination: Optional[str] = None    # Genus level
     campaign_year: Optional[int] = None
-    fecha_captura: Optional[str] = None    # Date from EXIF DateTimeOriginal (YYYYMMDD)
     
     # Hashing info
     md5_hash: Optional[str] = None
@@ -105,7 +105,6 @@ class ProcessedFile:
             'taxonomic_class': self.taxonomic_class,
             'determination': self.determination,
             'campaign_year': self.campaign_year,
-            'fecha_captura': self.fecha_captura,
             'md5_hash': self.md5_hash,
             'phash': self.phash,
             'is_duplicate': self.is_duplicate,
@@ -132,7 +131,6 @@ class ProcessedFile:
             taxonomic_class=data.get('taxonomic_class'),
             determination=data.get('determination'),
             campaign_year=data.get('campaign_year'),
-            fecha_captura=data.get('fecha_captura'),
             md5_hash=data.get('md5_hash'),
             phash=data.get('phash'),
             is_duplicate=data.get('is_duplicate', False),
@@ -233,11 +231,43 @@ class PipelineOrchestrator:
     7. REGISTRY_GENERATION: Create Excel registries
     
     File handling:
-    - Images: Organized into Collection/Campaign/Macroclass/Class/Determination folders
-    - Text files: Moved to Annotations folder, renamed with UUID prefix
-    - Other files: Moved to Other_Files folder, renamed with UUID prefix
+    - Images: Las Hoyas (default) at root: Campaign/Macroclass/Class/Determination
+             Other collections under Otras_Colecciones/<Collection>/Campaign/...
+    - Text files: Moved to Archivos_Texto folder, renamed with UUID prefix
+    - Other files: Moved to Otros_Archivos folder, renamed with UUID prefix
     """
     
+    @staticmethod
+    def compute_staging_dir(output_dir: Path, source_dirs: List[Path]) -> Path:
+        """
+        Compute the staging directory name: <output_dir>_<source_dir_name>.
+        
+        If multiple source dirs, joins their names with '_'.
+        
+        Args:
+            output_dir: The final output directory
+            source_dirs: List of source directories being processed
+            
+        Returns:
+            Path to the staging directory
+        """
+        if not source_dirs:
+            return output_dir / "_staging"
+        
+        # Build a suffix from source directory names
+        source_names = []
+        for sd in source_dirs:
+            name = Path(sd).name
+            # Sanitize: remove special chars, keep alphanumeric and underscores
+            safe_name = re.sub(r'[^\w\-]', '_', name)
+            safe_name = re.sub(r'_+', '_', safe_name).strip('_')
+            if safe_name:
+                source_names.append(safe_name)
+        
+        suffix = '_'.join(source_names) if source_names else 'unknown'
+        staging_name = f"{output_dir.name}_{suffix}"
+        return output_dir.parent / staging_name
+
     def __init__(
         self,
         source_dirs: List[Path],
@@ -250,6 +280,7 @@ class PipelineOrchestrator:
         interaction_mode: str = None,  # New: 'interactive', 'deferred', 'auto_accept', 'step_by_step'
         progress_callback: Callable[[str, int, int], None] = None,
         phash_threshold: int = 8,
+        use_staging: bool = True,  # New: whether to use staging directory
     ):
         """
         Initialize the orchestrator.
@@ -265,9 +296,17 @@ class PipelineOrchestrator:
             interaction_mode: 'interactive', 'deferred', 'auto_accept', or 'step_by_step'
             progress_callback: Called with (stage, current, total)
             phash_threshold: Threshold for perceptual hash matching
+            use_staging: If True, output to staging dir <output>_<source> for validation
         """
         self.source_dirs = [Path(d) for d in source_dirs]
-        self.output_dir = Path(output_base or output_dir) if (output_base or output_dir) else config.output_base_dir
+        self.final_output_dir = Path(output_base or output_dir) if (output_base or output_dir) else config.output_base_dir
+        self.use_staging = use_staging
+        
+        if use_staging and self.source_dirs:
+            self.output_dir = self.compute_staging_dir(self.final_output_dir, self.source_dirs)
+        else:
+            self.output_dir = self.final_output_dir
+        
         self.output_base = self.output_dir  # Alias for compatibility
         self.state_path = state_path or (self.output_dir / "pipeline_state.json")
         self.use_llm = use_llm
@@ -390,6 +429,21 @@ class PipelineOrchestrator:
         if not self.state.started_at:
             self.state.started_at = datetime.now().isoformat()
         
+        # Save staging info so the merge tool knows the final destination
+        if self.use_staging and self.output_dir != self.final_output_dir:
+            staging_info = {
+                'staging_dir': str(self.output_dir),
+                'final_output_dir': str(self.final_output_dir),
+                'source_directories': [str(d) for d in self.source_dirs],
+                'created_at': datetime.now().isoformat(),
+            }
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            staging_info_path = self.output_dir / "staging_info.json"
+            with open(staging_info_path, 'w', encoding='utf-8') as f:
+                json.dump(staging_info, f, indent=2, ensure_ascii=False)
+            logger.info(f"Staging directory: {self.output_dir}")
+            logger.info(f"Final output will be merged to: {self.final_output_dir}")
+        
         try:
             # Run stages with optional confirmation points
             if self.state.stage in [PipelineStage.INIT, PipelineStage.SCANNING]:
@@ -417,14 +471,15 @@ class PipelineOrchestrator:
                 if not self._confirm_stage_completion("DEDUPLICATION"):
                     return self.state
             
-            # IMPORTANT: Log to Excel FIRST, then move files
-            if self.state.stage == PipelineStage.REGISTRY_GENERATION:
-                self._run_registry_generation()
-                if not self._confirm_stage_completion("REGISTRY_GENERATION"):
-                    return self.state
-            
+            # IMPORTANT: Move files FIRST, then generate registries
+            # so that current_path is populated in the registry
             if self.state.stage == PipelineStage.ORGANIZING:
                 self._run_organizing()
+                if not self._confirm_stage_completion("ORGANIZING"):
+                    return self.state
+            
+            if self.state.stage == PipelineStage.REGISTRY_GENERATION:
+                self._run_registry_generation()
                 # No confirmation needed after final stage
             
             self.state.stage = PipelineStage.COMPLETED
@@ -572,6 +627,7 @@ class PipelineOrchestrator:
     def _run_scanning(self):
         """Stage 1: Scan directories to discover files."""
         logger.info("Stage 1: Scanning directories...")
+        self.action_logger.stage_start("SCANNING", f"Source dirs: {[str(d) for d in self.source_dirs]}")
         self.state.stage = PipelineStage.SCANNING
         
         all_files: List[ScannedFile] = []
@@ -580,15 +636,23 @@ class PipelineOrchestrator:
         valid_dirs = [d for d in self.source_dirs if d.exists()]
         if not valid_dirs:
             logger.warning("No valid source directories found")
+            self.action_logger.warning("No valid source directories found")
             self.state.stage = PipelineStage.LLM_ANALYSIS
             self._save_state()
             return
         
         logger.info(f"Scanning {len(valid_dirs)} directories")
+        self.action_logger.info(f"Scanning {len(valid_dirs)} directories: {[str(d) for d in valid_dirs]}")
         
         # Use file scanner - scan_directories returns a generator
         for scanned_file in self.file_scanner.scan_directories(valid_dirs):
             all_files.append(scanned_file)
+            # Log each discovered file
+            self.action_logger.file_scanned(
+                scanned_file.path,
+                scanned_file.file_type.value if scanned_file.file_type else 'unknown',
+                scanned_file.file_size
+            )
             self._report_progress("Scanning", len(all_files), self.file_scanner.progress.total_files)
         
         # Convert to ProcessedFile and store in state
@@ -606,6 +670,12 @@ class PipelineOrchestrator:
         self.state.stage = PipelineStage.LLM_ANALYSIS
         self._save_state()
         
+        # Log type breakdown
+        type_counts = {}
+        for sf in all_files:
+            t = sf.file_type.value if sf.file_type else 'unknown'
+            type_counts[t] = type_counts.get(t, 0) + 1
+        self.action_logger.stage_end("SCANNING", f"Total: {len(all_files)} files | Breakdown: {type_counts}")
         logger.info(f"Scanned {len(all_files)} files")
     
     def _run_llm_analysis(self):
@@ -627,6 +697,7 @@ class PipelineOrchestrator:
         logger.info("=" * 60)
         logger.info("Stage 2: MULTI-STAGE LLM ANALYSIS")
         logger.info("=" * 60)
+        self.action_logger.stage_start("LLM_ANALYSIS", f"Provider: {config.llm_provider}")
         self.state.stage = PipelineStage.LLM_ANALYSIS
         
         # Get unique directories from processed files
@@ -687,10 +758,22 @@ class PipelineOrchestrator:
                 print(f"       Campaign year: {path_analysis.campaign_year or 'None'}")
                 print(f"       Confidence: {path_analysis.confidence:.1%}")
                 
+                # Log to action_logger
+                self.action_logger.llm_path_analysis(
+                    directory=dir_path,
+                    macroclass=path_analysis.macroclass or 'None',
+                    taxonomic_class=path_analysis.taxonomic_class or 'None',
+                    genus=path_analysis.genus or 'None',
+                    collection=path_analysis.collection_code or 'unknown',
+                    campaign_year=path_analysis.campaign_year,
+                    confidence=path_analysis.confidence
+                )
+                
                 stats['path_analyses'] += 1
                 
             except Exception as e:
                 logger.warning(f"Path analysis failed for {dir_path}: {e}")
+                self.action_logger.llm_error("path_analysis", dir_path, str(e))
                 print(f"       ERROR: {e}")
                 path_analysis = None
             
@@ -709,12 +792,19 @@ class PipelineOrchestrator:
                     if regex_result.specimen_id_regex:
                         print(f"       Specimen ID regex: {regex_result.specimen_id_regex}")
                         print(f"       Extractable fields: {regex_result.extractable_fields}")
+                        self.action_logger.llm_regex_generated(
+                            directory=dir_path,
+                            regex=regex_result.specimen_id_regex,
+                            extractable_fields=regex_result.extractable_fields
+                        )
                         stats['regex_generated'] += 1
                     else:
                         print(f"       No regex pattern generated")
+                        self.action_logger.info(f"No regex pattern generated for {dir_path}")
                         
                 except Exception as e:
                     logger.warning(f"Regex generation failed for {dir_path}: {e}")
+                    self.action_logger.llm_error("regex_generation", dir_path, str(e))
                     print(f"       ERROR: {e}")
             else:
                 print(f"       Skipped (no files)")
@@ -737,18 +827,35 @@ class PipelineOrchestrator:
                     success_rate = len(successes) / len(all_filenames) if all_filenames else 0
                     print(f"       Matched: {len(successes)}/{len(all_filenames)} ({success_rate:.1%})")
                     
+                    # Log regex application results
+                    self.action_logger.llm_regex_applied(
+                        directory=dir_path,
+                        total=len(all_filenames),
+                        matched=len(successes),
+                        failed=len(failures)
+                    )
+                    
                     if failures:
                         print(f"       Failed: {len(failures)} files")
                         for fn in failures[:3]:
                             print(f"         - {fn}")
+                            self.action_logger.specimen_id_missing(fn, reason="regex_mismatch")
                         if len(failures) > 3:
                             print(f"         ... and {len(failures) - 3} more")
+                    
+                    # Log successful extractions
+                    for fn, extracted in successes.items():
+                        if 'specimen_id' in extracted:
+                            self.action_logger.specimen_id_found(
+                                fn, extracted['specimen_id'], source="llm_regex"
+                            )
                     
                     stats['regex_successes'] += len(successes)
                     stats['regex_failures'] += len(failures)
                     
                 except Exception as e:
                     logger.warning(f"Regex application failed: {e}")
+                    self.action_logger.llm_error("regex_application", dir_path, str(e))
                     print(f"       ERROR: {e}")
                     failures = all_filenames
             else:
@@ -774,11 +881,17 @@ class PipelineOrchestrator:
                             
                             if file_analysis.specimen_id:
                                 print(f"       [{j+1}/{len(failures)}] {fn} → {file_analysis.specimen_id}")
+                                self.action_logger.llm_per_file(
+                                    fn, file_analysis.specimen_id,
+                                    f"class={file_analysis.taxonomic_class}, confidence={file_analysis.confidence:.1%}"
+                                )
                             else:
                                 print(f"       [{j+1}/{len(failures)}] {fn} → No ID extracted")
+                                self.action_logger.llm_per_file(fn, None, "No ID extracted")
                                 
                         except Exception as e:
                             logger.warning(f"Per-file analysis failed for {fn}: {e}")
+                            self.action_logger.llm_error("per_file_analysis", fn, str(e))
                             
                 else:
                     print(f"       SKIPPED ({len(failures)} files is too many for per-file analysis)")
@@ -862,14 +975,24 @@ class PipelineOrchestrator:
         self.state.stage = PipelineStage.PATTERN_EXTRACTION
         self._save_state()
         
+        self.action_logger.stage_end(
+            "LLM_ANALYSIS",
+            f"Dirs: {stats['path_analyses']} | Regex: {stats['regex_generated']} | "
+            f"Matched: {stats['regex_successes']} | Failed: {stats['regex_failures']} | "
+            f"Fallbacks: {stats['per_file_fallbacks']}"
+        )
         logger.info(f"Analyzed {len(directories)} directories")
     
     def _run_pattern_extraction(self):
         """Stage 3: Extract patterns - known patterns first, then LLM regex if needed."""
         logger.info("Stage 3: Extracting patterns...")
+        self.action_logger.stage_start("PATTERN_EXTRACTION", f"{len(self.state.processed_files)} files to process")
         self.state.stage = PipelineStage.PATTERN_EXTRACTION
         
         total = len(self.state.processed_files)
+        ids_from_known = 0
+        ids_from_llm = 0
+        ids_missing = 0
         
         for i, (path_str, pf_data) in enumerate(self.state.processed_files.items()):
             path = Path(path_str)
@@ -883,6 +1006,10 @@ class PipelineOrchestrator:
             if result.specimen_id:
                 pf_data['specimen_id'] = result.specimen_id.specimen_id  # Use specimen_id attribute
                 logger.debug(f"Specimen ID from known pattern: {result.specimen_id.specimen_id}")
+                self.action_logger.specimen_id_found(
+                    path.name, result.specimen_id.specimen_id, source="known_pattern"
+                )
+                ids_from_known += 1
             
             # PRIORITY 2: If no specimen ID from known patterns, try LLM-provided regex
             if not pf_data.get('specimen_id') and dir_analysis.get('specimen_id_regex'):
@@ -891,6 +1018,18 @@ class PipelineOrchestrator:
                 if specimen_id:
                     pf_data['specimen_id'] = specimen_id
                     logger.debug(f"Specimen ID from LLM regex: {specimen_id}")
+                    self.action_logger.specimen_id_found(
+                        path.name, specimen_id, source="llm_regex"
+                    )
+                    ids_from_llm += 1
+            
+            # Log if still no specimen ID
+            if not pf_data.get('specimen_id'):
+                ids_missing += 1
+                self.action_logger.specimen_id_missing(
+                    path.name,
+                    reason="no_known_pattern_and_no_llm_regex"
+                )
             
             # Apply directory-level metadata
             if dir_analysis.get('collection_code'):
@@ -901,6 +1040,13 @@ class PipelineOrchestrator:
                 if collection:
                     pf_data['collection_code'] = collection
             
+            # Log collection detection
+            if pf_data.get('collection_code'):
+                self.action_logger.collection_detected(
+                    path.name, pf_data['collection_code'],
+                    source="dir_analysis" if dir_analysis.get('collection_code') else "path_detection"
+                )
+            
             if dir_analysis.get('taxonomic_class'):
                 pf_data['taxonomic_class'] = dir_analysis['taxonomic_class']
             
@@ -910,11 +1056,25 @@ class PipelineOrchestrator:
             if dir_analysis.get('campaign_year'):
                 pf_data['campaign_year'] = dir_analysis['campaign_year']
             
+            # Log full metadata summary for this file
+            self.action_logger.metadata_extracted(
+                path.name,
+                specimen_id=pf_data.get('specimen_id'),
+                collection=pf_data.get('collection_code'),
+                taxonomy=pf_data.get('taxonomic_class'),
+                campaign_year=pf_data.get('campaign_year'),
+                source="pattern_extraction"
+            )
+            
             self._report_progress("Pattern Extraction", i + 1, total)
         
         self.state.stage = PipelineStage.HASHING
         self._save_state()
         
+        self.action_logger.stage_end(
+            "PATTERN_EXTRACTION",
+            f"IDs from known patterns: {ids_from_known} | IDs from LLM regex: {ids_from_llm} | Missing: {ids_missing}"
+        )
         logger.info("Pattern extraction complete")
     
     def _run_hashing(self):
@@ -931,11 +1091,16 @@ class PipelineOrchestrator:
         
         total = len(image_files)
         logger.info(f"Hashing {total} image files")
+        self.action_logger.stage_start("HASHING", f"{total} image files to hash")
+        
+        exif_count = 0
+        hash_errors = 0
         
         for i, (path_str, pf_data) in enumerate(image_files):
             path = Path(path_str)
             
             if not path.exists():
+                self.action_logger.warning(f"File missing during hashing: {path}")
                 continue
             
             try:
@@ -945,18 +1110,51 @@ class PipelineOrchestrator:
                 pf_data['md5_hash'] = hash_result.md5_hash
                 pf_data['phash'] = hash_result.phash
                 
+                self.action_logger.hash_computed(
+                    path.name,
+                    md5=hash_result.md5_hash,
+                    phash=hash_result.phash
+                )
+                
                 # Extract EXIF date if available (uses DateTimeOriginal)
                 from .file_utils import MetadataExtractor
                 metadata = MetadataExtractor.extract(path)
                 if metadata and metadata.date_taken:
-                    pf_data['fecha_captura'] = metadata.date_taken
+                    exif_count += 1
+                    
+                    exif_year = None
+                    if metadata.datetime_original:
+                        exif_year = metadata.datetime_original.year
+                    
+                    path_year = pf_data.get('campaign_year')
+                    
+                    # Check for discrepancy between EXIF year and path-extracted year
+                    if exif_year and path_year:
+                        if int(path_year) != exif_year:
+                            logger.warning(
+                                f"Year discrepancy for {path.name}: "
+                                f"EXIF year={exif_year}, path year={path_year}"
+                            )
+                            self.action_logger.warning(
+                                f"Year discrepancy: {path.name} — "
+                                f"EXIF={exif_year} vs path={path_year}"
+                            )
+                    
                     # If no campaign_year from path, use EXIF year
-                    if not pf_data.get('campaign_year') and metadata.datetime_original:
-                        pf_data['campaign_year'] = metadata.datetime_original.year
+                    if not path_year and exif_year:
+                        pf_data['campaign_year'] = exif_year
+                    
+                    self.action_logger.exif_extracted(
+                        path.name,
+                        date_taken=metadata.date_taken,
+                        campaign_year=exif_year
+                    )
                 
             except Exception as e:
                 logger.warning(f"Failed to hash {path}: {e}")
                 pf_data['error'] = str(e)
+                hash_errors += 1
+                self.action_logger.hash_error(path.name, str(e))
             
             self.state.files_hashed = i + 1
             self._report_progress("Hashing", i + 1, total)
@@ -968,11 +1166,16 @@ class PipelineOrchestrator:
         self.state.stage = PipelineStage.DEDUPLICATION
         self._save_state()
         
+        self.action_logger.stage_end(
+            "HASHING",
+            f"Hashed: {total - hash_errors}/{total} | EXIF dates: {exif_count} | Errors: {hash_errors}"
+        )
         logger.info(f"Hashed {total} files")
     
     def _run_deduplication(self):
         """Stage 5: Identify duplicates."""
         logger.info("Stage 5: Identifying duplicates...")
+        self.action_logger.stage_start("DEDUPLICATION")
         self.state.stage = PipelineStage.DEDUPLICATION
         
         # Find duplicate groups
@@ -988,11 +1191,118 @@ class PipelineOrchestrator:
             # First file is the "original"
             original_path = str(group.files[0])
             
+            # Log the duplicate group
+            self.action_logger.duplicate_group(
+                dup_type=group.duplicate_type.value,
+                hash_value=group.hash_value,
+                file_count=len(group.files),
+                files=group.files
+            )
+            
+            # --- Check for metadata discrepancies across duplicate files ---
+            metadata_fields_to_check = [
+                'campaign_year', 'specimen_id', 'collection_code',
+                'macroclass', 'taxonomic_class', 'determination',
+            ]
+            discrepancies: Dict[str, list] = {}
+            group_file_strs = [str(f) for f in group.files]
+            
+            for field_name in metadata_fields_to_check:
+                values_seen: Dict[str, list] = {}  # value -> [file_paths]
+                for fpath_str in group_file_strs:
+                    pf = self.state.processed_files.get(fpath_str)
+                    if pf:
+                        val = pf.get(field_name)
+                        val_str = str(val) if val is not None else None
+                        if val_str not in values_seen:
+                            values_seen[val_str] = []
+                        values_seen[val_str].append(fpath_str)
+                
+                # Filter out None-only entries; a discrepancy is when there are
+                # ≥2 distinct NON-None values, OR 1 non-None vs None (meaningful diff)
+                non_none_vals = {v for v in values_seen if v is not None}
+                if len(non_none_vals) >= 2 or (len(non_none_vals) == 1 and None in values_seen):
+                    # Real discrepancy found
+                    disc_list = []
+                    for val_str, fpaths in values_seen.items():
+                        display_val = val_str if val_str is not None else "(empty)"
+                        for fp in fpaths:
+                            disc_list.append((fp, display_val))
+                    discrepancies[field_name] = disc_list
+            
+            if discrepancies:
+                logger.warning(
+                    f"Metadata discrepancy in duplicate group "
+                    f"(hash={group.hash_value[:16]}): "
+                    f"fields={list(discrepancies.keys())}"
+                )
+                self.action_logger.warning(
+                    f"Duplicate metadata discrepancy: "
+                    f"hash={group.hash_value[:16]} | "
+                    f"fields={list(discrepancies.keys())} | "
+                    f"files={[Path(f).name for f in group_file_strs]}"
+                )
+                
+                # Ask user to resolve
+                decision_request = create_duplicate_metadata_decision(
+                    file_paths=[Path(f) for f in group_file_strs],
+                    discrepancies=discrepancies,
+                )
+                result = self.interaction_manager.request_decision(decision_request)
+                
+                # Build a summary of discrepant fields for review_reason
+                disc_fields_str = ', '.join(discrepancies.keys())
+                
+                # Apply resolution
+                if result.outcome == DecisionOutcome.ACCEPT and result.selected_option is not None:
+                    if result.selected_option < len(group_file_strs):
+                        # Use metadata from the chosen file — apply ONLY to the
+                        # original (kept) file.  Duplicate files keep their own
+                        # metadata so the registry preserves both sets of info.
+                        chosen_path = group_file_strs[result.selected_option]
+                        chosen_pf = self.state.processed_files.get(chosen_path, {})
+                        for field_name in discrepancies:
+                            chosen_val = chosen_pf.get(field_name)
+                            self.state.processed_files[original_path][field_name] = chosen_val
+                        logger.info(
+                            f"Resolved duplicate metadata: using values from "
+                            f"{Path(chosen_path).name} (applied to original only)"
+                        )
+                    # else: last option = custom, handled below
+                
+                if result.outcome == DecisionOutcome.CUSTOM and result.custom_value:
+                    # Parse custom values — expect "field=value" pairs
+                    # Apply only to the original file
+                    for pair in result.custom_value.split(";"):
+                        pair = pair.strip()
+                        if "=" in pair:
+                            key, val = pair.split("=", 1)
+                            key, val = key.strip(), val.strip()
+                            if key in discrepancies:
+                                self.state.processed_files[original_path][key] = val
+                    logger.info("Resolved duplicate metadata with custom values (applied to original only)")
+                
+                # Routing depends on the user's decision:
+                # - ACCEPT / CUSTOM: user actively resolved → duplicates go
+                #   to Duplicados (normal flow).  No needs_review flag.
+                # - DEFER: user deferred → ALL files in the group go to
+                #   Revision_Manual so the user can decide later.
+                if result.outcome == DecisionOutcome.DEFER:
+                    short_hash = group.hash_value[:8]
+                    for fpath_str in group_file_strs:
+                        self.state.processed_files[fpath_str]['needs_review'] = True
+                        self.state.processed_files[fpath_str]['review_reason'] = (
+                            f"Discrepancia_metadata_{short_hash}"
+                        )
+            
             for dup_path in group.files[1:]:
                 path_str = str(dup_path)
                 if path_str in self.state.processed_files:
                     self.state.processed_files[path_str]['is_duplicate'] = True
                     self.state.processed_files[path_str]['duplicate_of'] = original_path
+                    self.action_logger.duplicate_found(
+                        Path(path_str), Path(original_path), group.hash_value
+                    )
             
             # Store group info
             self.state.duplicate_groups.append({
@@ -1001,10 +1311,14 @@ class PipelineOrchestrator:
                 'files': [str(f) for f in group.files],
             })
         
-        self.state.stage = PipelineStage.REGISTRY_GENERATION  # Log to Excel FIRST
+        self.state.stage = PipelineStage.ORGANIZING  # Move files first
         self._save_state()
         
         dup_count = sum(1 for pf in self.state.processed_files.values() if pf.get('is_duplicate'))
+        self.action_logger.stage_end(
+            "DEDUPLICATION",
+            f"Groups: {len(all_groups)} | Duplicate files: {dup_count} | Unique: {len(self.state.processed_files) - dup_count}"
+        )
         logger.info(f"Found {len(all_groups)} duplicate groups ({dup_count} duplicate files)")
     
     def _generate_new_filename(self, pf_data: Dict[str, Any], original_path: Path) -> str:
@@ -1049,7 +1363,9 @@ class PipelineOrchestrator:
     def _get_image_destination(self, pf_data: Dict[str, Any], source_path: Path) -> Tuple[Path, str]:
         """
         Determine destination path for an image file.
-        Structure: Campaña_[AÑO]/Macroclase/Clase/Genero/filename
+        
+        Structure (Las Hoyas / default): Campaña_[AÑO]/Macroclase/Clase/Genero/filename
+        Structure (other collections): Otras_Colecciones/<Collection>/Campaña_[AÑO]/...
         
         With fallbacks:
         - Sin_Campaña if no year
@@ -1065,16 +1381,22 @@ class PipelineOrchestrator:
         Returns:
             Tuple of (destination_directory, new_filename)
         """
-        # Handle duplicates separately
-        if pf_data.get('is_duplicate'):
-            dest_dir = self.output_dir / 'Duplicados'
+        # Handle items needing review FIRST — this takes priority over
+        # is_duplicate because discrepant duplicates need human attention.
+        if pf_data.get('needs_review'):
+            reason = pf_data.get('review_reason', 'Otro')
+            # Sanitize reason for use as directory name (remove Windows-invalid chars)
+            import re as _re
+            reason = _re.sub(r'[<>:"/\\|?*\[\]\']', '', reason).strip()
+            if not reason:
+                reason = 'Otro'
+            dest_dir = self.output_dir / 'Revision_Manual' / reason
             new_filename = self._generate_new_filename(pf_data, source_path)
             return dest_dir, new_filename
         
-        # Handle items needing review
-        if pf_data.get('needs_review'):
-            reason = pf_data.get('review_reason', 'Otro')
-            dest_dir = self.output_dir / 'Revision_Manual' / reason
+        # Handle duplicates (without review flags)
+        if pf_data.get('is_duplicate'):
+            dest_dir = self.output_dir / 'Duplicados'
             new_filename = self._generate_new_filename(pf_data, source_path)
             return dest_dir, new_filename
         
@@ -1089,7 +1411,16 @@ class PipelineOrchestrator:
             return dest_dir, new_filename
         
         # Start building destination path
-        dest_dir = self.output_dir
+        # Las Hoyas is the default collection — goes to root.
+        # Buenache/Montsec go under Otras_Colecciones/<collection_name>/
+        collection = pf_data.get('collection_code', '')
+        if collection in ('BUE',):
+            dest_dir = self.output_dir / 'Otras_Colecciones' / 'Buenache'
+        elif collection in ('MON',):
+            dest_dir = self.output_dir / 'Otras_Colecciones' / 'Montsec'
+        else:
+            # LH, unknown, or anything else → root (Las Hoyas is default)
+            dest_dir = self.output_dir
         
         # Campaign level
         campaign = pf_data.get('campaign_year')
@@ -1105,7 +1436,7 @@ class PipelineOrchestrator:
             tax_class = pf_data.get('taxonomic_class')
             macroclass = get_macroclass_folder(tax_class)
         
-        if macroclass and macroclass != 'Unsorted_Macroclass':
+        if macroclass:
             dest_dir = dest_dir / macroclass
         else:
             dest_dir = dest_dir / 'Sin_Macroclase'
@@ -1148,18 +1479,21 @@ class PipelineOrchestrator:
             file_uuid = str(uuid_lib.uuid4())[:8]
             pf_data['file_uuid'] = file_uuid
         
+        # Determine collection prefix
+        # Las Hoyas is default (root), Buenache/Montsec under Otras_Colecciones/
+        collection = pf_data.get('collection_code', '')
+        if collection in ('BUE',):
+            collection_base = self.output_dir / 'Otras_Colecciones' / 'Buenache'
+        elif collection in ('MON',):
+            collection_base = self.output_dir / 'Otras_Colecciones' / 'Montsec'
+        else:
+            collection_base = self.output_dir
+        
         # Determine base directory
         if is_text:
-            base_dir = self.output_dir / 'Annotations'
+            dest_dir = collection_base / 'Archivos_Texto'
         else:
-            base_dir = self.output_dir / 'Other_Files'
-        
-        # Optional: split by collection if known
-        collection = pf_data.get('collection_code')
-        if collection:
-            dest_dir = base_dir / collection
-        else:
-            dest_dir = base_dir / 'Unsorted'
+            dest_dir = collection_base / 'Otros_Archivos'
         
         # Generate new filename: <uuid>_<original_name>
         original_name = source_path.name
@@ -1170,27 +1504,28 @@ class PipelineOrchestrator:
         return dest_dir, new_filename
     
     def _run_organizing(self):
-        """Stage 7: Organize files into collection folders with renaming.
+        """Stage 6: Organize files into collection folders with renaming.
         
-        NOTE: This runs AFTER registry generation, so Excel logs are complete
-        even if file move fails.
+        NOTE: This runs BEFORE registry generation, so current_path in the 
+        registry reflects the final destination of each file.
         """
-        logger.info("Stage 7: Organizing files (moving to final destinations)...")
+        logger.info("Stage 6: Organizing files (moving to final destinations)...")
+        self.action_logger.stage_start("ORGANIZING", f"dry_run={self.dry_run}")
         self.state.stage = PipelineStage.ORGANIZING
         
         if self.dry_run:
             logger.info("DRY RUN - Not moving files")
+            self.action_logger.info("DRY RUN mode — files will not be moved")
         
         # Create base output directories
+        # Las Hoyas is default (root), other collections under Otras_Colecciones/
         base_dirs = [
-            self.output_dir / 'Las_Hoyas',
-            self.output_dir / 'Buenache',
-            self.output_dir / 'Montsec',
-            self.output_dir / 'Unknown_Collection',
-            self.output_dir / 'Duplicates',
-            self.output_dir / 'Manual_Review',
-            self.output_dir / 'Annotations',
-            self.output_dir / 'Other_Files',
+            self.output_dir / 'Otras_Colecciones' / 'Buenache',
+            self.output_dir / 'Otras_Colecciones' / 'Montsec',
+            self.output_dir / 'Duplicados',
+            self.output_dir / 'Revision_Manual',
+            self.output_dir / 'Archivos_Texto',
+            self.output_dir / 'Otros_Archivos',
         ]
         
         if not self.dry_run:
@@ -1231,6 +1566,21 @@ class PipelineOrchestrator:
             pf_data['destination_path'] = str(dest_path)
             pf_data['new_filename'] = new_filename
             
+            # Log destination decision with reasoning
+            reason_parts = []
+            if pf_data.get('is_duplicate'):
+                reason_parts.append("duplicate")
+            elif pf_data.get('needs_review'):
+                reason_parts.append(f"review:{pf_data.get('review_reason', '?')}")
+            else:
+                reason_parts.append(f"collection={pf_data.get('collection_code', 'default')}")
+                reason_parts.append(f"class={pf_data.get('taxonomic_class', 'unknown')}")
+                reason_parts.append(f"year={pf_data.get('campaign_year', 'unknown')}")
+            self.action_logger.file_destination(
+                source_path, dest_path,
+                reason=" | ".join(reason_parts)
+            )
+            
             # Move/copy file
             if not self.dry_run:
                 try:
@@ -1242,6 +1592,7 @@ class PipelineOrchestrator:
                     self.action_logger.file_copied(source_path, dest_path)
                 except Exception as e:
                     logger.warning(f"Failed to copy {source_path}: {e}")
+                    self.action_logger.error(f"Failed to copy {source_path}", e)
                     pf_data['error'] = str(e)
             
             self.state.files_organized = i + 1
@@ -1260,9 +1611,13 @@ class PipelineOrchestrator:
         if not self.dry_run:
             self._cleanup_empty_directories()
         
-        self.state.stage = PipelineStage.COMPLETED  # Organizing is now the last stage
+        self.state.stage = PipelineStage.REGISTRY_GENERATION  # Registry now runs AFTER organizing
         self._save_state()
         
+        self.action_logger.stage_end(
+            "ORGANIZING",
+            f"Organized: {self.state.files_organized} files | dry_run={self.dry_run}"
+        )
         logger.info(f"Organized {self.state.files_organized} files")
     
     def _cleanup_empty_directories(self):
@@ -1289,12 +1644,15 @@ class PipelineOrchestrator:
             logger.info(f"Cleaned up {deleted_count} empty directories")
     
     def _run_registry_generation(self):
-        """Stage 6: Generate Excel registries for images, text files, and other files.
+        """Stage 7: Generate Excel registries for images, text files, and other files.
         
-        IMPORTANT: This runs BEFORE organizing (file move) so that if move fails,
-        we still have a complete log of intended operations.
+        IMPORTANT: This runs AFTER organizing (file move) so that current_path
+        reflects the final destination of each file.
+        Duplicates are NOT included in anotaciones.xlsx — they get their own
+        registry file inside the Duplicados folder.
         """
-        logger.info("Stage 6: Generating registries (logging to Excel BEFORE file move)...")
+        logger.info("Stage 7: Generating registries (logging to Excel AFTER file move)...")
+        self.action_logger.stage_start("REGISTRY_GENERATION")
         self.state.stage = PipelineStage.REGISTRY_GENERATION
         
         # Create Excel manager
@@ -1302,10 +1660,18 @@ class PipelineOrchestrator:
         registries_dir.mkdir(parents=True, exist_ok=True)
         excel_manager = ExcelManager(registries_dir)
         
+        # Separate Excel manager for duplicates registry
+        duplicados_dir = self.output_dir / "Duplicados"
+        duplicados_dir.mkdir(parents=True, exist_ok=True)
+        
         # Counters for different file types
         image_count = 0
+        duplicate_count = 0
         text_count = 0
         other_count = 0
+        
+        # Collect duplicate records separately
+        duplicate_records: list = []
         
         # Add processed files to appropriate registries
         for path_str, pf_data in self.state.processed_files.items():
@@ -1313,10 +1679,46 @@ class PipelineOrchestrator:
             file_type = FileType(file_type_str) if file_type_str else FileType.OTHER
             
             if file_type == FileType.IMAGE:
-                # Build comment with auto-extraction info
-                comments = []
+                # --- Hashes registry: ALL images (including duplicates) ---
+                file_uuid = pf_data.get('file_uuid') or ImageRecord.generate_uuid()
+                md5 = pf_data.get('md5_hash', '')
+                phash = pf_data.get('phash', '')
+                excel_manager.add_hash(
+                    uuid=file_uuid,
+                    md5_hash=md5,
+                    phash=phash,
+                    file_path=Path(pf_data.get('destination_path') or path_str),
+                )
+                
+                # --- Check if duplicate ---
                 if pf_data.get('is_duplicate'):
-                    comments.append(f"[AUTO] duplicate_of={pf_data.get('duplicate_of')}")
+                    # Build comments for duplicate record
+                    comments = [f"[AUTO] duplicate_of={pf_data.get('duplicate_of')}"]
+                    if pf_data.get('needs_review'):
+                        comments.append(f"[REVIEW] {pf_data.get('review_reason')}")
+                    
+                    dup_record = ImageRecord(
+                        uuid=file_uuid,
+                        specimen_id=pf_data.get('specimen_id'),
+                        original_path=path_str,
+                        current_path=pf_data.get('destination_path'),
+                        macroclass_label=pf_data.get('macroclass') or get_macroclass_folder(pf_data.get('taxonomic_class')),
+                        class_label=pf_data.get('taxonomic_class'),
+                        genera_label=pf_data.get('determination'),
+                        campaign_year=str(pf_data.get('campaign_year')) if pf_data.get('campaign_year') else None,
+                        fuente=pf_data.get('collection_code'),
+                        comentarios=" | ".join(comments),
+                    )
+                    duplicate_records.append(dup_record)
+                    duplicate_count += 1
+                    self.action_logger.registry_entry(
+                        "duplicate", pf_data.get('filename', ''),
+                        specimen_id=pf_data.get('specimen_id')
+                    )
+                    continue  # Do NOT add duplicates to main anotaciones.xlsx
+                
+                # --- Main anotaciones.xlsx: non-duplicate images only ---
+                comments = []
                 if pf_data.get('needs_review'):
                     comments.append(f"[REVIEW] {pf_data.get('review_reason')}")
                 if pf_data.get('collection_code'):
@@ -1324,62 +1726,70 @@ class PipelineOrchestrator:
                 if pf_data.get('specimen_id'):
                     comments.append(f"[AUTO] specimen_id extracted from path/filename")
                 
+                # Get macroclass — None if unknown (no more Unsorted_Macroclass)
+                macroclass = pf_data.get('macroclass') or get_macroclass_folder(pf_data.get('taxonomic_class'))
+                
                 record = ImageRecord(
-                    uuid=pf_data.get('file_uuid') or ImageRecord.generate_uuid(),
+                    uuid=file_uuid,
                     specimen_id=pf_data.get('specimen_id'),
                     original_path=path_str,
                     current_path=pf_data.get('destination_path'),
-                    macroclass_label=pf_data.get('macroclass') or get_macroclass_folder(pf_data.get('taxonomic_class')),
+                    macroclass_label=macroclass,
                     class_label=pf_data.get('taxonomic_class'),
                     genera_label=pf_data.get('determination'),
-                    fecha_captura=pf_data.get('fecha_captura'),  # EXIF DateTimeOriginal
                     campaign_year=str(pf_data.get('campaign_year')) if pf_data.get('campaign_year') else None,
                     fuente=pf_data.get('collection_code'),
-                    hash_perceptual=pf_data.get('phash'),
                     comentarios=" | ".join(comments) if comments else "[AUTO] processed by pipeline",
                 )
                 excel_manager.add_image(record)
                 image_count += 1
+                self.action_logger.registry_entry(
+                    "image", pf_data.get('filename', ''),
+                    specimen_id=pf_data.get('specimen_id')
+                )
                 
             elif file_type == FileType.TEXT:
-                record = TextFileRecord(
-                    id=pf_data.get('file_uuid') or str(uuid_lib.uuid4())[:8],
-                    original_path=path_str,
-                    current_path=pf_data.get('destination_path') or '',
-                    original_filename=pf_data.get('filename', ''),
-                    file_type=Path(path_str).suffix,
-                    processed=False,
-                    extracted_info=None,
-                )
-                excel_manager.add_text_file(record)
+                original_path = Path(path_str)
+                current_path = Path(pf_data.get('destination_path') or path_str)
+                excel_manager.add_text_file(original_path, current_path)
                 text_count += 1
+                self.action_logger.registry_entry("text", pf_data.get('filename', ''))
                 
             else:
-                record = OtherFileRecord(
-                    id=pf_data.get('file_uuid') or str(uuid_lib.uuid4())[:8],
-                    original_path=path_str,
-                    current_path=pf_data.get('destination_path') or '',
-                    original_filename=pf_data.get('filename', ''),
-                    file_type=Path(path_str).suffix,
-                )
-                excel_manager.add_other_file(record)
+                original_path = Path(path_str)
+                current_path = Path(pf_data.get('destination_path') or path_str)
+                excel_manager.add_other_file(original_path, current_path)
                 other_count += 1
+                self.action_logger.registry_entry("other", pf_data.get('filename', ''))
         
-        # Save all registries
+        # Save all main registries
         excel_manager.save_all()
         logger.info(f"Saved registries to: {registries_dir}")
         logger.info(f"  Images: {image_count}, Text files: {text_count}, Other: {other_count}")
+        
+        # Save duplicate registry to Duplicados/duplicados_registro.xlsx
+        if duplicate_records:
+            import pandas as pd
+            from dataclasses import asdict
+            dup_df = pd.DataFrame([asdict(r) for r in duplicate_records])
+            dup_registry_path = duplicados_dir / "duplicados_registro.xlsx"
+            dup_df.to_excel(dup_registry_path, index=False)
+            logger.info(f"Saved {duplicate_count} duplicate records to: {dup_registry_path}")
         
         # Also save a summary CSV for easy viewing
         summary_path = self.output_dir / "processing_summary.csv"
         self._save_summary_csv(summary_path)
         logger.info(f"Saved summary: {summary_path}")
         
-        # Transition to ORGANIZING stage (file move)
-        self.state.stage = PipelineStage.ORGANIZING
+        # Transition to COMPLETED
+        self.state.stage = PipelineStage.COMPLETED
         self._save_state()
         
-        logger.info("Registry generation complete - proceeding to file move")
+        self.action_logger.stage_end(
+            "REGISTRY_GENERATION",
+            f"Images: {image_count} | Duplicates: {duplicate_count} | Text: {text_count} | Other: {other_count}"
+        )
+        logger.info("Registry generation complete")
     
     def _save_summary_csv(self, path: Path):
         """Save a summary CSV of all processed files."""
@@ -1448,7 +1858,8 @@ def run_pipeline(
     use_llm: bool = True,
     dry_run: bool = False,
     resume: bool = False,
-    progress_callback: Callable = None
+    progress_callback: Callable = None,
+    use_staging: bool = True
 ) -> PipelineState:
     """
     Convenience function to run the full pipeline.
@@ -1460,6 +1871,7 @@ def run_pipeline(
         dry_run: If True, don't move files
         resume: If True, try to resume from saved state
         progress_callback: Progress callback function
+        use_staging: If True, output to staging dir for validation before merge
         
     Returns:
         Final PipelineState
@@ -1472,7 +1884,8 @@ def run_pipeline(
         output_dir=output_path,
         use_llm=use_llm,
         dry_run=dry_run,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
+        use_staging=use_staging,
     )
     
     return orchestrator.run(resume=resume)

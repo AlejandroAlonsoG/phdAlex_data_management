@@ -24,6 +24,7 @@ class DecisionType(Enum):
     NUMERIC_ID_AMBIGUITY = "numeric_id_ambiguity"  # Is 12345 a specimen ID or camera counter?
     METADATA_CONFLICT = "metadata_conflict"         # Path says X, filename says Y
     DUPLICATE_DETECTED = "duplicate_detected"       # File is duplicate of another
+    DUPLICATE_METADATA_DISCREPANCY = "duplicate_metadata_discrepancy"  # Duplicates have different metadata
     FILENAME_COLLISION = "filename_collision"       # Two files with same destination name
     UNKNOWN_COLLECTION = "unknown_collection"       # Cannot determine collection
     NO_SPECIMEN_ID = "no_specimen_id"               # Could not extract specimen ID
@@ -158,36 +159,43 @@ class InteractionManager:
         print(f"File: {request.file_path}")
         print(f"\n{request.message}")
         
-        if request.context:
+        is_dup_meta = (request.decision_type == DecisionType.DUPLICATE_METADATA_DISCREPANCY)
+        
+        # Show context only for non-table decision types (table is already in the message)
+        if request.context and not is_dup_meta:
             print("\nContext:")
             for key, value in request.context.items():
                 print(f"  {key}: {value}")
         
         print("\nOptions:")
         for i, option in enumerate(request.options):
-            default_marker = " [default]" if i == request.default_option else ""
-            print(f"  [{i}] {option}{default_marker}")
+            print(f"  [{i}] {option}")
         
         print(f"  [d] Defer to manual review folder")
-        print(f"  [s] Skip this file")
-        print(f"  [c] Enter custom value")
+        if not is_dup_meta:
+            # s and c are general-purpose; not shown for duplicate metadata
+            # (custom per-field is already option [{last}] above)
+            print(f"  [s] Skip this file")
+            print(f"  [c] Enter custom value")
+        
+        if is_dup_meta:
+            valid_keys = f"0-{len(request.options)-1}, d"
+        else:
+            valid_keys = f"0-{len(request.options)-1}, d, s, c"
         
         while True:
             try:
-                choice = input(f"\nEnter choice [{request.default_option}]: ").strip().lower()
+                choice = input(f"\nEnter choice ({valid_keys}): ").strip().lower()
                 
                 if choice == '':
-                    # Use default
-                    return DecisionResult(
-                        outcome=DecisionOutcome.ACCEPT,
-                        selected_option=request.default_option,
-                    )
+                    print("Please select an option explicitly.")
+                    continue
                 elif choice == 'd':
                     self.deferred_items.append(request)
                     return DecisionResult(outcome=DecisionOutcome.DEFER)
-                elif choice == 's':
+                elif choice == 's' and not is_dup_meta:
                     return DecisionResult(outcome=DecisionOutcome.SKIP)
-                elif choice == 'c':
+                elif choice == 'c' and not is_dup_meta:
                     custom = input("Enter custom value: ").strip()
                     return DecisionResult(
                         outcome=DecisionOutcome.CUSTOM,
@@ -196,18 +204,50 @@ class InteractionManager:
                 elif choice.isdigit():
                     idx = int(choice)
                     if 0 <= idx < len(request.options):
+                        # For dup-metadata, the last numbered option is
+                        # "Enter custom value per field" — handle inline.
+                        if is_dup_meta and idx == len(request.options) - 1:
+                            return self._prompt_custom_per_field(request)
                         return DecisionResult(
                             outcome=DecisionOutcome.ACCEPT,
                             selected_option=idx,
                         )
                     else:
-                        print(f"Invalid option. Choose 0-{len(request.options)-1}")
+                        print(f"Invalid option. Choose {valid_keys}")
                 else:
                     print("Invalid input. Try again.")
             except KeyboardInterrupt:
                 print("\nInterrupted. Deferring this item.")
                 self.deferred_items.append(request)
                 return DecisionResult(outcome=DecisionOutcome.DEFER)
+    
+    def _prompt_custom_per_field(self, request: DecisionRequest) -> DecisionResult:
+        """Sub-prompt for entering a custom value per discrepant field.
+        
+        Shows each discrepant field with its current values across files,
+        then asks the user to type the desired value.
+        """
+        discrepancies = request.context.get('discrepancies', {})
+        file_paths = request.context.get('file_paths', [])
+        file_names = [Path(fp).name for fp in file_paths]
+        
+        print("\n--- Enter custom value for each field ---")
+        custom_values = {}
+        for field_name, entries in discrepancies.items():
+            values_display = ", ".join(
+                f"[{i}] {file_names[i]}={val}" for i, (_, val) in enumerate(entries)
+            )
+            print(f"\n  {field_name}: {values_display}")
+            val = input(f"  Enter value for '{field_name}': ").strip()
+            if val:
+                custom_values[field_name] = val
+        
+        # Encode as "field=value; field2=value2" for the orchestrator
+        custom_str = "; ".join(f"{k}={v}" for k, v in custom_values.items())
+        return DecisionResult(
+            outcome=DecisionOutcome.CUSTOM,
+            custom_value=custom_str,
+        )
     
     def _deferred_decision(self, request: DecisionRequest) -> DecisionResult:
         """Automatically defer to review folder."""
@@ -331,6 +371,7 @@ class InteractionManager:
             DecisionType.NUMERIC_ID_AMBIGUITY: "Ambiguous_IDs",
             DecisionType.METADATA_CONFLICT: "Metadata_Conflicts",
             DecisionType.DUPLICATE_DETECTED: "Duplicates_Review",
+            DecisionType.DUPLICATE_METADATA_DISCREPANCY: "Duplicate_Metadata_Review",
             DecisionType.FILENAME_COLLISION: "Filename_Collisions",
             DecisionType.UNKNOWN_COLLECTION: "Unknown_Collection",
             DecisionType.NO_SPECIMEN_ID: "No_Specimen_ID",
@@ -453,6 +494,96 @@ def create_duplicate_decision(
             "MERGE metadata and keep one",
         ],
         default_option=0,  # Default to skip duplicate
+    )
+
+
+def create_duplicate_metadata_decision(
+    file_paths: List[Path],
+    discrepancies: Dict[str, List],
+) -> DecisionRequest:
+    """Create a decision request for duplicates with differing metadata.
+    
+    Args:
+        file_paths: All files in the duplicate group
+        discrepancies: Dict mapping field_name -> list of (file_path, value) pairs
+    """
+    # --- Build a comparison table ---
+    file_names = [Path(fp).name for fp in file_paths]
+    field_names = list(discrepancies.keys())
+    
+    # Build a value lookup:  field -> {file_path_str -> value}
+    value_map: Dict[str, Dict[str, str]] = {}
+    for field_name, entries in discrepancies.items():
+        value_map[field_name] = {}
+        for fpath_str, val in entries:
+            value_map[field_name][str(fpath_str)] = val
+    
+    # Determine column widths for the table
+    field_header = "Field"
+    col_width_field = max(len(field_header), *(len(f) for f in field_names))
+    
+    col_widths = []
+    for i, fp in enumerate(file_paths):
+        fname = file_names[i]
+        header_label = f"[{i}] {fname}"
+        max_val_len = 0
+        for field_name in field_names:
+            val = value_map[field_name].get(str(fp), "(empty)")
+            max_val_len = max(max_val_len, len(val))
+        col_widths.append(max(len(header_label), max_val_len))
+    
+    # Build the table
+    sep = "─"
+    lines = []
+    
+    # Header
+    header_parts = [f" {field_header:<{col_width_field}} "]
+    for i, fp in enumerate(file_paths):
+        header_label = f"[{i}] {file_names[i]}"
+        header_parts.append(f" {header_label:<{col_widths[i]}} ")
+    
+    divider_parts = [sep * (col_width_field + 2)]
+    for w in col_widths:
+        divider_parts.append(sep * (w + 2))
+    
+    lines.append("┌" + "┬".join(divider_parts) + "┐")
+    lines.append("│" + "│".join(header_parts) + "│")
+    lines.append("├" + "┼".join(divider_parts) + "┤")
+    
+    # Data rows — one per discrepant field
+    for field_name in field_names:
+        row_parts = [f" {field_name:<{col_width_field}} "]
+        for i, fp in enumerate(file_paths):
+            val = value_map[field_name].get(str(fp), "(empty)")
+            row_parts.append(f" {val:<{col_widths[i]}} ")
+        lines.append("│" + "│".join(row_parts) + "│")
+    
+    lines.append("└" + "┴".join(divider_parts) + "┘")
+    table_text = "\n".join(lines)
+    
+    # Build options: one per file (use that file's metadata) + custom
+    options = []
+    for i, fpath in enumerate(file_paths):
+        options.append(f"Use metadata from [{i}]: {Path(fpath).name}")
+    options.append("Enter custom value for each discrepant field")
+    
+    return DecisionRequest(
+        decision_type=DecisionType.DUPLICATE_METADATA_DISCREPANCY,
+        file_path=file_paths[0],  # Primary file
+        message=(
+            f"Duplicate group ({len(file_paths)} files) has metadata discrepancies\n"
+            f"Discrepant fields: {', '.join(field_names)}\n\n"
+            f"{table_text}"
+        ),
+        context={
+            'file_paths': [str(p) for p in file_paths],
+            'discrepancies': {
+                k: [(str(p), v) for p, v in vals]
+                for k, vals in discrepancies.items()
+            },
+        },
+        options=options,
+        default_option=0,  # Default to first file (the "original")
     )
 
 
