@@ -947,7 +947,7 @@ class PipelineOrchestrator:
                 
                 # Extract EXIF date if available (uses DateTimeOriginal)
                 from .file_utils import MetadataExtractor
-                metadata = MetadataExtractor.extract_image_metadata(path)
+                metadata = MetadataExtractor.extract(path)
                 if metadata and metadata.date_taken:
                     pf_data['fecha_captura'] = metadata.date_taken
                     # If no campaign_year from path, use EXIF year

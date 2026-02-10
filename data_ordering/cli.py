@@ -254,9 +254,13 @@ def run_cli(args: argparse.Namespace) -> int:
         # Resume or run fresh
         if args.resume:
             print(f"Resuming from saved state...")
-            orchestrator.load_state()
-            print(f"  Stage: {orchestrator.state.stage.value}")
-            print(f"  Files scanned: {orchestrator.state.files_scanned}")
+            # Load state to show info before running
+            from .main_orchestrator import PipelineState
+            state_file = args.output.resolve() / "pipeline_state.json"
+            if state_file.exists():
+                saved = PipelineState.load(state_file)
+                print(f"  Stage: {saved.stage.value}")
+                print(f"  Files scanned: {saved.files_scanned}")
         
         # Run pipeline
         if not args.quiet:
@@ -267,7 +271,7 @@ def run_cli(args: argparse.Namespace) -> int:
             print(f"Interaction mode: {interaction_mode}")
             print()
         
-        orchestrator.run()
+        orchestrator.run(resume=args.resume)
         
         # Print summary
         print_summary(orchestrator)
