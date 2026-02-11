@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -298,68 +299,65 @@ class OutputMerger:
         print(f"  Conflicts resolved: {self.stats['files_skipped_conflict']}")
     
     def _merge_registries(self):
-        """Merge Excel registry files from staging into output."""
+        """Merge Excel registry files from staging into output.
+
+        The *anotaciones* and *hashes* registries are merged together in a
+        single cross-referenced pass: for each staging image we look for a
+        match by hash **or** specimen-id in the output, then reconcile the
+        annotation fields.
+
+        The remaining registries (archivos_texto, archivos_otros,
+        duplicados_registro) are merged independently by original_path.
+        """
         print("\n--- Merging Registries ---")
-        
+
         staging_reg_dir = self.staging_dir / self.REGISTRY_DIR
         output_reg_dir = self.output_dir / self.REGISTRY_DIR
-        
+
         if not staging_reg_dir.exists():
             print("  No registries in staging directory")
             return
-        
+
         if not self.dry_run:
             output_reg_dir.mkdir(parents=True, exist_ok=True)
-        
-        for registry_file in self.REGISTRY_FILES:
+
+        # ── 1. Cross-referenced merge of annotations + hashes ───────
+        self._merge_annotations_and_hashes(staging_reg_dir, output_reg_dir)
+
+        # ── 2. Simple registries ────────────────────────────────────
+        for registry_file in ("archivos_texto.xlsx", "archivos_otros.xlsx"):
             staging_reg = staging_reg_dir / registry_file
             output_reg = output_reg_dir / registry_file
-            
+
             if not staging_reg.exists():
                 continue
-            
+
             print(f"\n  Merging: {registry_file}")
-            
+
             if not output_reg.exists():
-                # No existing registry — just copy
                 if not self.dry_run:
                     shutil.copy2(staging_reg, output_reg)
                 staging_df = pd.read_excel(staging_reg)
                 self.stats['registry_records_merged'] += len(staging_df)
                 print(f"    Copied {len(staging_df)} records (new registry)")
                 continue
-            
-            # Both exist — merge
+
             try:
                 staging_df = pd.read_excel(staging_reg)
                 output_df = pd.read_excel(output_reg)
-                
-                # Determine the key column for dedup
-                if registry_file == "anotaciones.xlsx":
-                    key_col = 'uuid'
-                    merge_result = self._merge_dataframes(
-                        staging_df, output_df, key_col, registry_file
-                    )
-                elif registry_file == "hashes.xlsx":
-                    key_col = 'uuid'
-                    merge_result = self._merge_dataframes(
-                        staging_df, output_df, key_col, registry_file
-                    )
-                else:
-                    key_col = 'id'
-                    merge_result = self._merge_dataframes(
-                        staging_df, output_df, key_col, registry_file
-                    )
-                
+                merge_result = self._merge_dataframes(
+                    staging_df, output_df,
+                    match_cols=['original_path'],
+                    registry_name=registry_file,
+                )
                 if merge_result is not None and not self.dry_run:
                     merge_result.to_excel(output_reg, index=False)
-                
             except Exception as e:
                 logger.error(f"Failed to merge {registry_file}: {e}")
                 self.stats['errors'] += 1
                 print(f"    ERROR: {e}")
-        
-        # Handle duplicate registry (lives in Duplicados/ not registries/)
+
+        # ── 3. Duplicate registry (Duplicados/) ─────────────────────
         staging_dup_reg = self.staging_dir / self.DUPLICATE_REGISTRY
         output_dup_reg = self.output_dir / self.DUPLICATE_REGISTRY
         if staging_dup_reg.exists():
@@ -376,7 +374,10 @@ class OutputMerger:
                     staging_df = pd.read_excel(staging_dup_reg)
                     output_df = pd.read_excel(output_dup_reg)
                     merge_result = self._merge_dataframes(
-                        staging_df, output_df, 'uuid', "duplicados_registro.xlsx"
+                        staging_df, output_df,
+                        match_cols=['specimen_id', 'original_path'],
+                        registry_name="duplicados_registro.xlsx",
+                        normalize_fn=self._normalize_specimen_id,
                     )
                     if merge_result is not None and not self.dry_run:
                         merge_result.to_excel(output_dup_reg, index=False)
@@ -385,136 +386,631 @@ class OutputMerger:
                 self.stats['errors'] += 1
                 print(f"    ERROR: {e}")
     
+    # ------------------------------------------------------------------
+    # Normalisation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_specimen_id(value: str) -> str:
+        """Normalise a specimen_id for comparison.
+
+        Strips separators (-, _, spaces), lowercases, and removes
+        surrounding whitespace so that e.g. 'LH-22270-a' matches
+        'lh22270a'.
+        """
+        if not value:
+            return ''
+        return re.sub(r'[\s\-_]+', '', value.strip()).lower()
+
+    @staticmethod
+    def _merge_original_paths(existing: str, incoming: str) -> str:
+        """Combine two original_path values into a deduplicated ';'-separated list."""
+        parts: list[str] = []
+        for raw in (existing, incoming):
+            if raw:
+                for p in raw.split(';'):
+                    p = p.strip()
+                    if p and p not in parts:
+                        parts.append(p)
+        return '; '.join(parts)
+
+    # ------------------------------------------------------------------
+    # Unified cross-referenced merge (annotations + hashes)
+    # ------------------------------------------------------------------
+
+    def _merge_annotations_and_hashes(
+        self,
+        staging_reg_dir: Path,
+        output_reg_dir: Path,
+    ):
+        """Merge anotaciones.xlsx and hashes.xlsx together.
+
+        For each staging annotation record the method looks for a match in
+        the output by **md5 hash** (primary) or **normalised specimen_id**
+        (secondary).  When a match is found every field is compared:
+
+        * Identical / one side fills a gap → auto-merged silently.
+        * Real discrepancy → user prompted with [0][1][2][d].
+
+        The hashes registry is kept in sync: overlapping hashes are
+        deduplicated and new ones are appended.
+        """
+        staging_ann_path = staging_reg_dir / "anotaciones.xlsx"
+        staging_hash_path = staging_reg_dir / "hashes.xlsx"
+        output_ann_path = output_reg_dir / "anotaciones.xlsx"
+        output_hash_path = output_reg_dir / "hashes.xlsx"
+
+        # --- Load staging data ---
+        s_ann = pd.read_excel(staging_ann_path) if staging_ann_path.exists() else None
+        s_hash = pd.read_excel(staging_hash_path) if staging_hash_path.exists() else None
+
+        if s_ann is None and s_hash is None:
+            return  # nothing to merge
+
+        # --- If output doesn't exist yet, just copy ---
+        ann_is_new = not output_ann_path.exists()
+        hash_is_new = not output_hash_path.exists()
+
+        if ann_is_new and s_ann is not None:
+            if not self.dry_run:
+                shutil.copy2(staging_ann_path, output_ann_path)
+            self.stats['registry_records_merged'] += len(s_ann)
+            print(f"\n  Merging: anotaciones.xlsx")
+            print(f"    Copied {len(s_ann)} records (new registry)")
+
+        if hash_is_new and s_hash is not None:
+            if not self.dry_run:
+                shutil.copy2(staging_hash_path, output_hash_path)
+            self.stats['registry_records_merged'] += len(s_hash)
+            print(f"\n  Merging: hashes.xlsx")
+            print(f"    Copied {len(s_hash)} records (new registry)")
+
+        if ann_is_new and hash_is_new:
+            return  # both were new, nothing to reconcile
+
+        # --- Load output data ---
+        o_ann = pd.read_excel(output_ann_path) if output_ann_path.exists() else pd.DataFrame()
+        o_hash = pd.read_excel(output_hash_path) if output_hash_path.exists() else pd.DataFrame()
+
+        # Reload staging if they were just copied (we still need to reconcile
+        # the other registry that already existed)
+        if s_ann is None:
+            s_ann = pd.DataFrame()
+        if s_hash is None:
+            s_hash = pd.DataFrame()
+
+        # If one side was brand-new and just copied, we only need to
+        # reconcile the other registry.
+        if ann_is_new or hash_is_new:
+            # Only the registry that already existed needs merging
+            if not ann_is_new and s_ann is not None and len(s_ann):
+                print(f"\n  Merging: anotaciones.xlsx")
+                result = self._merge_dataframes(
+                    s_ann, o_ann,
+                    match_cols=['specimen_id', 'original_path'],
+                    registry_name='anotaciones.xlsx',
+                    normalize_fn=self._normalize_specimen_id,
+                )
+                if result is not None and not self.dry_run:
+                    result.to_excel(output_ann_path, index=False)
+            if not hash_is_new and s_hash is not None and len(s_hash):
+                print(f"\n  Merging: hashes.xlsx")
+                result = self._merge_dataframes(
+                    s_hash, o_hash,
+                    match_cols=['md5_hash'],
+                    registry_name='hashes.xlsx',
+                )
+                if result is not None and not self.dry_run:
+                    result.to_excel(output_hash_path, index=False)
+            return
+
+        # ── Both registries exist on both sides → cross-referenced merge ─
+
+        print(f"\n  Cross-referenced merge: anotaciones.xlsx + hashes.xlsx")
+
+        # Ensure all columns that might receive strings are object dtype
+        # (pandas may infer float64 for columns that are all-NaN).
+        for col in o_ann.columns:
+            if o_ann[col].dtype != object:
+                o_ann[col] = o_ann[col].astype(object)
+
+        # Build a lookup: staging file_path → md5_hash
+        s_path_to_hash: Dict[str, str] = {}
+        if 'file_path' in s_hash.columns and 'md5_hash' in s_hash.columns:
+            for _, row in s_hash.iterrows():
+                fp = str(row['file_path']) if pd.notna(row['file_path']) else ''
+                md5 = str(row['md5_hash']) if pd.notna(row['md5_hash']) else ''
+                if fp and md5:
+                    s_path_to_hash[fp] = md5
+
+        # Build a lookup: output md5_hash → index in o_ann
+        # We link o_hash → o_ann via file_path == current_path
+        o_hash_to_path: Dict[str, str] = {}
+        if 'file_path' in o_hash.columns and 'md5_hash' in o_hash.columns:
+            for _, row in o_hash.iterrows():
+                fp = str(row['file_path']) if pd.notna(row['file_path']) else ''
+                md5 = str(row['md5_hash']) if pd.notna(row['md5_hash']) else ''
+                if fp and md5:
+                    o_hash_to_path[md5] = fp
+
+        # Build output specimen_id normalised → index in o_ann
+        o_specid_norm: Dict[str, int] = {}
+        if 'specimen_id' in o_ann.columns:
+            for idx, val in o_ann['specimen_id'].items():
+                norm = self._normalize_specimen_id(str(val) if pd.notna(val) else '')
+                if norm:
+                    o_specid_norm[norm] = idx
+
+        # Build output current_path → index in o_ann
+        o_curpath_to_idx: Dict[str, int] = {}
+        if 'current_path' in o_ann.columns:
+            for idx, val in o_ann['current_path'].items():
+                cp = str(val) if pd.notna(val) else ''
+                if cp:
+                    o_curpath_to_idx[cp] = idx
+
+        skip_cols = {'created_at', 'updated_at', 'timestamp', 'uuid', 'id',
+                     'current_path'}  # current_path changes after merge
+        rows_auto_merged = 0
+        conflicts_resolved = 0
+        new_count = 0
+        processed_output_indices: set = set()
+
+        for s_idx, s_row in s_ann.iterrows():
+            # --- Find matching output annotation ---
+            matched_idx: Optional[int] = None
+
+            # 1. Match by hash
+            s_current = str(s_row.get('current_path', '')) if pd.notna(s_row.get('current_path')) else ''
+            s_md5 = s_path_to_hash.get(s_current, '')
+            if s_md5 and s_md5 in o_hash_to_path:
+                o_file = o_hash_to_path[s_md5]
+                if o_file in o_curpath_to_idx:
+                    matched_idx = o_curpath_to_idx[o_file]
+
+            # 2. Match by normalised specimen_id
+            if matched_idx is None:
+                s_specid = str(s_row.get('specimen_id', '')) if pd.notna(s_row.get('specimen_id')) else ''
+                s_norm = self._normalize_specimen_id(s_specid)
+                if s_norm and s_norm in o_specid_norm:
+                    matched_idx = o_specid_norm[s_norm]
+
+            if matched_idx is None:
+                # Truly new record
+                new_count += 1
+                continue
+
+            processed_output_indices.add(matched_idx)
+            o_row = o_ann.loc[matched_idx]
+
+            # --- Always accumulate original_path ---
+            if 'original_path' in s_ann.columns and 'original_path' in o_ann.columns:
+                s_orig = str(s_row.get('original_path', '')) if pd.notna(s_row.get('original_path')) else ''
+                o_orig = str(o_row.get('original_path', '')) if pd.notna(o_row.get('original_path')) else ''
+                merged_paths = self._merge_original_paths(o_orig, s_orig)
+                if merged_paths != o_orig and not self.dry_run:
+                    o_ann.at[matched_idx, 'original_path'] = merged_paths
+
+            # --- Field-by-field comparison ---
+            discrepancies: Dict[str, Dict[str, str]] = {}
+
+            for col in s_ann.columns:
+                if col in skip_cols or col == 'original_path':
+                    continue
+                if col not in o_ann.columns:
+                    continue
+
+                s_val = s_row.get(col)
+                o_val = o_row.get(col)
+
+                s_str = str(s_val) if pd.notna(s_val) else ''
+                o_str = str(o_val) if pd.notna(o_val) else ''
+
+                if s_str == o_str:
+                    continue
+
+                if not o_str and s_str:
+                    # Staging fills a gap → auto-merge
+                    if not self.dry_run:
+                        o_ann.at[matched_idx, col] = s_val
+                    rows_auto_merged += 1
+                elif o_str and not s_str:
+                    # Output already has data → keep it
+                    pass
+                else:
+                    discrepancies[col] = {
+                        'staging': s_str,
+                        'output': o_str,
+                    }
+
+            if not discrepancies:
+                continue
+
+            # --- Real conflict → prompt user ---
+            s_specid_display = s_row.get('specimen_id', '(no id)')
+            match_reason = f"hash={s_md5[:12]}..." if s_md5 else f"specimen_id={s_specid_display}"
+
+            # Build context info for the user
+            context_info: list[str] = []
+            o_specid_display = o_row.get('specimen_id', '(no id)') if pd.notna(o_row.get('specimen_id', None)) else '(no id)'
+            context_info.append(f"specimen_id:  existing={o_specid_display}  |  staging={s_specid_display}")
+            o_orig = str(o_row.get('original_path', '')) if pd.notna(o_row.get('original_path', None)) else ''
+            s_orig = str(s_row.get('original_path', '')) if pd.notna(s_row.get('original_path', None)) else ''
+            if o_orig or s_orig:
+                context_info.append(f"original_path (existing): {o_orig or '(empty)'}")
+                context_info.append(f"original_path (staging):  {s_orig or '(empty)'}")
+            o_cur = str(o_row.get('current_path', '')) if pd.notna(o_row.get('current_path', None)) else ''
+            s_cur = str(s_row.get('current_path', '')) if pd.notna(s_row.get('current_path', None)) else ''
+            if o_cur or s_cur:
+                context_info.append(f"current_path (existing):  {o_cur or '(empty)'}")
+                context_info.append(f"current_path (staging):   {s_cur or '(empty)'}")
+
+            table = self._build_comparison_table(discrepancies, match_reason, context_info=context_info)
+
+            choice = self._ask_merge_conflict(
+                header=f"Merge conflict ({match_reason})",
+                table=table,
+            )
+
+            if choice == 0:
+                # Keep existing (output) values
+                pass
+            elif choice == 1:
+                # Use staging values
+                for col in discrepancies:
+                    if not self.dry_run:
+                        o_ann.at[matched_idx, col] = s_row[col]
+            elif choice == 2:
+                # Custom per field
+                for col, d in discrepancies.items():
+                    custom_val = self._ask_custom_field(col, d['output'], d['staging'])
+                    if custom_val is not None and not self.dry_run:
+                        o_ann.at[matched_idx, col] = custom_val
+            elif choice == -1:
+                # Defer — keep output as-is for now
+                pass
+
+            conflicts_resolved += 1
+            self.stats['registry_conflicts'] += 1
+
+        # Append truly new annotation rows
+        if new_count:
+            new_indices = []
+            for s_idx2, s_row2 in s_ann.iterrows():
+                m_idx = None
+                sc = str(s_row2.get('current_path', '')) if pd.notna(s_row2.get('current_path')) else ''
+                smd5 = s_path_to_hash.get(sc, '')
+                if smd5 and smd5 in o_hash_to_path:
+                    of = o_hash_to_path[smd5]
+                    if of in o_curpath_to_idx:
+                        m_idx = o_curpath_to_idx[of]
+                if m_idx is None:
+                    ssp = str(s_row2.get('specimen_id', '')) if pd.notna(s_row2.get('specimen_id')) else ''
+                    sn = self._normalize_specimen_id(ssp)
+                    if sn and sn in o_specid_norm:
+                        m_idx = o_specid_norm[sn]
+                if m_idx is None:
+                    new_indices.append(s_idx2)
+
+            if new_indices:
+                new_rows = s_ann.loc[new_indices]
+                o_ann = pd.concat([o_ann, new_rows], ignore_index=True)
+                self.stats['registry_records_merged'] += len(new_rows)
+
+        if not self.dry_run:
+            o_ann.to_excel(output_ann_path, index=False)
+
+        # --- Merge hashes registry (simple dedup by md5_hash) ---
+        if len(s_hash) and len(o_hash):
+            existing_hashes = set(o_hash['md5_hash'].dropna().astype(str))
+            new_hash_rows = s_hash[~s_hash['md5_hash'].astype(str).isin(existing_hashes)]
+            if len(new_hash_rows):
+                o_hash = pd.concat([o_hash, new_hash_rows], ignore_index=True)
+                self.stats['registry_records_merged'] += len(new_hash_rows)
+            if not self.dry_run:
+                o_hash.to_excel(output_hash_path, index=False)
+
+        print(f"    Existing annotation records: {len(o_ann) - new_count}")
+        print(f"    Staging annotation records: {len(s_ann)}")
+        print(f"    Matched (by hash or ID): {len(s_ann) - new_count}")
+        print(f"    New records appended: {new_count}")
+        if rows_auto_merged:
+            print(f"    Fields auto-merged (gap-fill): {rows_auto_merged}")
+        if conflicts_resolved:
+            print(f"    Conflicts resolved: {conflicts_resolved}")
+
+    # ------------------------------------------------------------------
+    # Merge conflict UI  ([0] existing / [1] staging / [2] custom / [d] defer)
+    # ------------------------------------------------------------------
+
+    def _ask_merge_conflict(self, header: str, table: str) -> int:
+        """Prompt the user about a merge conflict.
+
+        Returns:
+            0  – keep existing (output)
+            1  – use staging values
+            2  – enter custom value per field
+            -1 – defer
+        """
+        if self.auto_accept:
+            return 0  # keep existing is the safe default
+
+        print(f"\n{'─'*60}")
+        print(f"CONFLICT: {header}")
+        print(f"{'─'*60}")
+        print(table)
+        print()
+        print("  [0] Keep existing (output) values")
+        print("  [1] Use staging values")
+        print("  [2] Enter custom value for each field")
+        print("  [d] Defer (leave for later)")
+
+        while True:
+            try:
+                choice = input("\nEnter choice (0, 1, 2, d): ").strip().lower()
+                if choice == '0':
+                    return 0
+                elif choice == '1':
+                    return 1
+                elif choice == '2':
+                    return 2
+                elif choice == 'd':
+                    return -1
+                else:
+                    print("Invalid input. Enter 0, 1, 2, or d.")
+            except (KeyboardInterrupt, EOFError):
+                print("\nDeferred.")
+                return -1
+
+    def _ask_custom_field(
+        self, field_name: str, output_val: str, staging_val: str,
+    ) -> Optional[str]:
+        """Ask the user for a custom value for a single field."""
+        if self.auto_accept:
+            return None  # keep existing
+        print(f"\n  {field_name}:  [0] existing = '{output_val}'  |  [1] staging = '{staging_val}'")
+        val = input(f"  Enter value for '{field_name}' (or 0/1 to pick): ").strip()
+        if val == '0':
+            return output_val
+        elif val == '1':
+            return staging_val
+        elif val:
+            return val
+        return None  # keep existing
+
+    # ------------------------------------------------------------------
+    # Comparison-table builder (merge conflict UI)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_comparison_table(
+        discrepancies: Dict[str, Dict[str, str]],
+        match_label: str,
+        context_info: Optional[list[str]] = None,
+    ) -> str:
+        """Return a box-drawing comparison table for a merge conflict.
+
+        Args:
+            discrepancies: {col_name: {'staging': val, 'output': val}}
+            match_label: human-readable label identifying the matched record
+            context_info: Optional list of informational lines to show above
+                          the conflict table (e.g. specimen_id, paths).
+        """
+        field_header = "Field"
+        col_a_header = "Existing (output)"
+        col_b_header = "Staging"
+
+        field_names = list(discrepancies.keys())
+
+        col_w_field = max(len(field_header), *(len(f) for f in field_names))
+        col_w_a = max(
+            len(col_a_header),
+            *(len(d['output']) for d in discrepancies.values()),
+        )
+        col_w_b = max(
+            len(col_b_header),
+            *(len(d['staging']) for d in discrepancies.values()),
+        )
+
+        sep = "─"
+        div = [sep * (col_w_field + 2), sep * (col_w_a + 2), sep * (col_w_b + 2)]
+
+        lines: list[str] = []
+        if context_info:
+            for ci in context_info:
+                lines.append(f"  {ci}")
+            lines.append("")  # blank separator before the table
+        lines.append("┌" + "┬".join(div) + "┐")
+        lines.append(
+            "│"
+            + f" {field_header:<{col_w_field}} │"
+            + f" {col_a_header:<{col_w_a}} │"
+            + f" {col_b_header:<{col_w_b}} │"
+        )
+        lines.append("├" + "┼".join(div) + "┤")
+        for fname in field_names:
+            o_val = discrepancies[fname]['output']
+            s_val = discrepancies[fname]['staging']
+            lines.append(
+                "│"
+                + f" {fname:<{col_w_field}} │"
+                + f" {o_val:<{col_w_a}} │"
+                + f" {s_val:<{col_w_b}} │"
+            )
+        lines.append("└" + "┴".join(div) + "┘")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Core merge logic
+    # ------------------------------------------------------------------
+
     def _merge_dataframes(
         self,
         staging_df: pd.DataFrame,
         output_df: pd.DataFrame,
-        key_col: str,
+        match_cols: list[str],
         registry_name: str,
+        normalize_fn=None,
     ) -> Optional[pd.DataFrame]:
-        """
-        Merge two DataFrames, handling conflicts.
-        
+        """Merge two DataFrames, matching by *match_cols* instead of UUID.
+
+        The first column in *match_cols* that is present in both DataFrames
+        is used as the primary match key.  If *normalize_fn* is given it is
+        applied to the primary key values before comparison (the original
+        values are preserved in the output).
+
         New records from staging are appended.
-        Records with same key are checked for discrepancies.
-        
+        Records with the same key are checked for field discrepancies.
+
         Args:
-            staging_df: DataFrame from staging
-            output_df: DataFrame from existing output
-            key_col: Column to use as unique key
-            registry_name: Name of the registry for user messages
-            
+            staging_df:   DataFrame from staging
+            output_df:    DataFrame from existing output
+            match_cols:   Ordered list of candidate match columns
+            registry_name: Name of the registry (for logging/UI)
+            normalize_fn: Optional callable(str)->str for key normalisation
+
         Returns:
-            Merged DataFrame or None if no changes
+            Merged DataFrame, or None if no changes
         """
-        if key_col not in staging_df.columns or key_col not in output_df.columns:
-            # Can't merge by key — just append
+
+        # --- Pick the first usable match column ---
+        key_col: Optional[str] = None
+        for col in match_cols:
+            if col in staging_df.columns and col in output_df.columns:
+                key_col = col
+                break
+
+        if key_col is None:
+            # No shared match column — just append
             merged = pd.concat([output_df, staging_df], ignore_index=True)
             self.stats['registry_records_merged'] += len(staging_df)
-            print(f"    Appended {len(staging_df)} records (no key column '{key_col}')")
+            print(f"    Appended {len(staging_df)} records (no usable match column among {match_cols})")
             return merged
-        
-        # Find new vs existing records
-        existing_keys = set(output_df[key_col].dropna().astype(str))
-        staging_keys = set(staging_df[key_col].dropna().astype(str))
-        
-        new_keys = staging_keys - existing_keys
-        overlapping_keys = staging_keys & existing_keys
-        
+
+        # --- Helper: make normalised key series ---
+        def _make_key(df: pd.DataFrame) -> pd.Series:
+            raw = df[key_col].fillna('').astype(str)
+            if normalize_fn is not None:
+                return raw.map(normalize_fn)
+            return raw
+
+        staging_keys = _make_key(staging_df)
+        output_keys = _make_key(output_df)
+
+        staging_key_set = set(staging_keys)
+        output_key_set = set(output_keys)
+
+        new_keys = staging_key_set - output_key_set - {''}
+        overlapping_keys = staging_key_set & output_key_set - {''}
+
+        print(f"    Match column: {key_col}" + (f" (normalised)" if normalize_fn else ""))
         print(f"    Existing records: {len(output_df)}")
         print(f"    Staging records: {len(staging_df)}")
         print(f"    New records: {len(new_keys)}")
         print(f"    Overlapping records: {len(overlapping_keys)}")
-        
-        # Handle overlapping records — check for discrepancies
+
+        # --- Handle overlapping records ---
         conflicts_resolved = 0
         rows_updated = 0
-        
-        for key in overlapping_keys:
-            staging_row = staging_df[staging_df[key_col].astype(str) == key].iloc[0]
-            output_idx = output_df[output_df[key_col].astype(str) == key].index[0]
+        skip_cols = {'created_at', 'updated_at', 'timestamp', 'uuid', 'id',
+                     'current_path'}  # current_path changes after merge
+
+        for norm_key in overlapping_keys:
+            # Find first matching row in each DF
+            staging_row = staging_df[staging_keys == norm_key].iloc[0]
+            output_idx = output_df[output_keys == norm_key].index[0]
             output_row = output_df.loc[output_idx]
-            
-            # Find columns with discrepancies (excluding timestamp columns)
-            skip_cols = {'created_at', 'updated_at', 'timestamp'}
-            discrepancies = {}
-            
+
+            # Always accumulate original_path
+            if 'original_path' in staging_df.columns and 'original_path' in output_df.columns:
+                s_orig = str(staging_row.get('original_path', '')) if pd.notna(staging_row.get('original_path')) else ''
+                o_orig = str(output_row.get('original_path', '')) if pd.notna(output_row.get('original_path')) else ''
+                merged_paths = self._merge_original_paths(o_orig, s_orig)
+                if merged_paths != o_orig and not self.dry_run:
+                    output_df.at[output_idx, 'original_path'] = merged_paths
+
+            discrepancies: Dict[str, Dict[str, str]] = {}
+
             for col in staging_df.columns:
-                if col in skip_cols or col == key_col:
+                if col in skip_cols or col == key_col or col == 'original_path':
                     continue
                 if col not in output_df.columns:
                     continue
-                    
-                staging_val = staging_row.get(col)
-                output_val = output_row.get(col)
-                
-                # Normalize for comparison
-                s_str = str(staging_val) if pd.notna(staging_val) else ''
-                o_str = str(output_val) if pd.notna(output_val) else ''
-                
+
+                s_val = staging_row.get(col)
+                o_val = output_row.get(col)
+
+                s_str = str(s_val) if pd.notna(s_val) else ''
+                o_str = str(o_val) if pd.notna(o_val) else ''
+
                 if s_str != o_str:
-                    # Check if staging fills in a gap (output is empty)
                     if not o_str and s_str:
-                        # Staging has data, output doesn't — auto-merge
+                        # Staging fills a gap → auto-merge
                         if not self.dry_run:
-                            output_df.at[output_idx, col] = staging_val
+                            output_df.at[output_idx, col] = s_val
                         rows_updated += 1
                     elif o_str and not s_str:
-                        # Output has data, staging doesn't — keep output
+                        # Output has data, staging empty → keep output
                         pass
                     else:
-                        # Both have different data — this is a real conflict
                         discrepancies[col] = {
                             'staging': s_str,
                             'output': o_str,
                         }
-            
+
             if discrepancies:
-                # Ask user about discrepancies
-                disc_summary = "\n".join(
-                    f"    {col}: staging='{d['staging']}' vs output='{d['output']}'"
-                    for col, d in discrepancies.items()
-                )
-                
+                match_display = f"{key_col}={staging_row[key_col]}"
+
+                # Build context info for the user
+                ctx_info: list[str] = []
+                for info_col in ['specimen_id', 'original_path', 'current_path']:
+                    if info_col in staging_df.columns or info_col in output_df.columns:
+                        s_v = str(staging_row.get(info_col, '')) if info_col in staging_df.columns and pd.notna(staging_row.get(info_col, None)) else ''
+                        o_v = str(output_row.get(info_col, '')) if info_col in output_df.columns and pd.notna(output_row.get(info_col, None)) else ''
+                        if s_v or o_v:
+                            ctx_info.append(f"{info_col} (existing): {o_v or '(empty)'}")
+                            ctx_info.append(f"{info_col} (staging):  {s_v or '(empty)'}")
+
+                table = self._build_comparison_table(discrepancies, match_display, context_info=ctx_info)
+
                 choice = self._ask_user(
-                    f"Registry conflict for {key_col}={key} in {registry_name}:\n{disc_summary}",
+                    f"Registry conflict in {registry_name} ({match_display}):\n{table}",
                     [
                         "Keep existing values",
                         "Use staging values",
                         "Merge (staging fills gaps, keep existing where both have values)",
                     ],
-                    default=2  # Merge is safest
+                    default=2,
                 )
-                
+
                 if choice == 1:
-                    # Use staging values for conflicting fields
                     for col in discrepancies:
                         if not self.dry_run:
                             output_df.at[output_idx, col] = staging_row[col]
                     rows_updated += 1
                 elif choice == 2:
-                    # Merge: staging fills gaps only
                     for col, d in discrepancies.items():
                         if not d['output']:
                             if not self.dry_run:
                                 output_df.at[output_idx, col] = staging_row[col]
                     rows_updated += 1
-                # choice == 0: keep existing (do nothing)
-                
+                # choice == 0: keep existing
+
                 conflicts_resolved += 1
                 self.stats['registry_conflicts'] += 1
-        
-        # Add new records
+
+        # --- Add truly new records ---
         if new_keys:
-            new_rows = staging_df[staging_df[key_col].astype(str).isin(new_keys)]
+            new_mask = staging_keys.isin(new_keys)
+            new_rows = staging_df[new_mask]
             output_df = pd.concat([output_df, new_rows], ignore_index=True)
-            self.stats['registry_records_merged'] += len(new_keys)
-        
+            self.stats['registry_records_merged'] += len(new_rows)
+
         if rows_updated:
             print(f"    Updated {rows_updated} existing records")
         if conflicts_resolved:
             print(f"    Resolved {conflicts_resolved} conflicts")
-        
+
         return output_df
     
     def _update_registry_paths(self):
@@ -570,7 +1066,7 @@ class OutputMerger:
             Dictionary of merge statistics
         """
         print("=" * 60)
-        print("MERGE STAGING → OUTPUT")
+        print("MERGE STAGING -> OUTPUT")
         print("=" * 60)
         print(f"Staging:  {self.staging_dir}")
         print(f"Output:   {self.output_dir}")

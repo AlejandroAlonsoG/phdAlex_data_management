@@ -4,6 +4,7 @@ Computes perceptual hashes (pHash) for near-duplicate detection
 and MD5 hashes for exact duplicate detection.
 """
 import hashlib
+import io
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Set
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ try:
 except ImportError:
     IMAGEHASH_AVAILABLE = False
     
-from .config import IMAGE_EXTENSIONS, IMAGE_WITH_METADATA_SUPPORT
+from .config import IMAGE_EXTENSIONS, IMAGE_WITH_METADATA_SUPPORT, PIL_CONVERTIBLE_EXTENSIONS, JPEG_QUALITY
 
 
 logger = logging.getLogger(__name__)
@@ -83,14 +84,19 @@ class ImageHasher:
     # Lower = more similar required
     NEAR_DUPLICATE_THRESHOLD = 8
     
-    def __init__(self, phash_threshold: int = None):
+    def __init__(self, phash_threshold: int = None, normalize_images: bool = True):
         """
         Initialize the image hasher.
         
         Args:
             phash_threshold: Maximum hamming distance for near-duplicate detection
+            normalize_images: If True, image files that PIL can open are
+                converted to a canonical RGB JPEG in memory before computing
+                MD5.  This makes the hash format-independent so that the same
+                image saved as .png / .tiff / .jpg produces the same MD5.
         """
         self.phash_threshold = phash_threshold or self.NEAR_DUPLICATE_THRESHOLD
+        self.normalize_images = normalize_images
         
         if not IMAGEHASH_AVAILABLE:
             logger.warning(
@@ -101,6 +107,15 @@ class ImageHasher:
         """
         Compute MD5 hash of a file.
         
+        When *normalize_images* is enabled and the file has a
+        PIL-convertible extension, the image is loaded, converted to
+        RGB and re-encoded as JPEG at ``JPEG_QUALITY`` in memory.
+        The MD5 is then computed on those canonical bytes so that the
+        same visual image in different formats produces the same hash.
+        
+        For non-image files or images PIL cannot open, the raw
+        file bytes are hashed as before.
+        
         Args:
             file_path: Path to file
             chunk_size: Read buffer size
@@ -108,6 +123,26 @@ class ImageHasher:
         Returns:
             Hex string of MD5 hash
         """
+        # --- Normalised (JPEG-canonical) MD5 for images ---
+        if (self.normalize_images
+                and IMAGEHASH_AVAILABLE
+                and file_path.suffix.lower() in PIL_CONVERTIBLE_EXTENSIONS):
+            try:
+                with Image.open(file_path) as img:
+                    if img.mode not in ('RGB', 'L'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'L':
+                        img = img.convert('RGB')
+                    buf = io.BytesIO()
+                    img.save(buf, format='JPEG', quality=JPEG_QUALITY)
+                    return hashlib.md5(buf.getvalue()).hexdigest()
+            except Exception as e:
+                logger.debug(
+                    f"PIL could not normalise {file_path.name}, "
+                    f"falling back to file-bytes MD5: {e}"
+                )
+
+        # --- Fallback: raw file-bytes MD5 ---
         md5 = hashlib.md5()
         try:
             with open(file_path, 'rb') as f:

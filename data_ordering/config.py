@@ -125,6 +125,17 @@ IMAGE_WITHOUT_METADATA_SUPPORT = {
 
 IMAGE_EXTENSIONS = IMAGE_WITH_METADATA_SUPPORT | IMAGE_WITHOUT_METADATA_SUPPORT
 
+# JPEG normalization settings
+JPEG_QUALITY = 95  # Quality for JPEG conversion (1-100)
+
+# Image extensions that PIL/Pillow can reliably open and convert to JPEG.
+# Formats outside this set will keep their original format and use
+# file-bytes MD5 instead of normalised-JPEG MD5.
+PIL_CONVERTIBLE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif',
+    '.webp', '.psd',  # Pillow reads flattened PSD
+}
+
 TEXT_EXTENSIONS = {
     '.txt', '.pdf', '.doc', '.docx', '.odt', '.rtf',
     '.md', '.markdown', '.tex', '.csv',

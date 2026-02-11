@@ -502,7 +502,7 @@ def test_merge_output():
 
 
 def test_merge_with_existing():
-    """Test merging into an output that already has files."""
+    """Test merging into an output that already has files, including dedup."""
     print("\n" + "=" * 60)
     print("MERGE WITH EXISTING FILES TEST")
     print("=" * 60)
@@ -516,29 +516,64 @@ def test_merge_with_existing():
         source_dir.mkdir(parents=True)
         output_dir.mkdir()
         
-        # Pre-populate output with some files
+        # --- Pre-populate output with existing files ---
         existing_dir = output_dir / "Campaña_2020" / "Arthropoda"
         existing_dir.mkdir(parents=True)
         (existing_dir / "existing_file.jpg").write_text("existing image")
         
-        # Pre-populate registry
+        # The staging pipeline will process "LH 15083.jpg" with content
+        # "new image 1".  We pre-populate an annotation record for the
+        # SAME specimen (LH-15083) so the cross-ref merge recognises
+        # it as a duplicate and merges rather than appending.
         import pandas as pd
-        from data_ordering.excel_manager import ImageRecord
+        import hashlib
+        from data_ordering.excel_manager import ImageRecord, HashRecord
         from dataclasses import asdict
         
         reg_dir = output_dir / "registries"
         reg_dir.mkdir(parents=True)
         
-        existing_record = ImageRecord(
-            uuid="existing-uuid-001",
-            specimen_id="LH 99999",
-            original_path="/old/path/existing.jpg",
-            current_path=str(existing_dir / "existing_file.jpg"),
-        )
-        df = pd.DataFrame([asdict(existing_record)])
-        df.to_excel(reg_dir / "anotaciones.xlsx", index=False)
+        existing_img_path = str(existing_dir / "existing_file.jpg")
         
-        # Create source files
+        # Two annotation records: one that will NOT match (LH 99999)
+        # and one that WILL match (LH-15083, same specimen as staging).
+        existing_records = [
+            ImageRecord(
+                uuid="existing-uuid-001",
+                specimen_id="LH 99999",
+                original_path="/old/path/existing.jpg",
+                current_path=existing_img_path,
+            ),
+            ImageRecord(
+                uuid="existing-uuid-002",
+                specimen_id="LH-15083",
+                original_path="/old/path/LH 15083.jpg",
+                current_path=str(output_dir / "old_run" / "LH-15083.jpg"),
+                macroclass_label="Arthropoda",  # extra data in output
+            ),
+        ]
+        df_ann = pd.DataFrame([asdict(r) for r in existing_records])
+        df_ann.to_excel(reg_dir / "anotaciones.xlsx", index=False)
+        
+        # Pre-populate hashes for the existing records
+        existing_hashes = [
+            HashRecord(
+                uuid="hash-uuid-001",
+                md5_hash=hashlib.md5(b"existing image").hexdigest(),
+                phash="",
+                file_path=existing_img_path,
+            ),
+            HashRecord(
+                uuid="hash-uuid-002",
+                md5_hash="dummy_hash_for_old_run",
+                phash="",
+                file_path=str(output_dir / "old_run" / "LH-15083.jpg"),
+            ),
+        ]
+        df_hash = pd.DataFrame([asdict(r) for r in existing_hashes])
+        df_hash.to_excel(reg_dir / "hashes.xlsx", index=False)
+        
+        # Create source file — same specimen as existing-uuid-002
         (source_dir / "LH 15083.jpg").write_text("new image 1")
         
         # Run pipeline with staging
@@ -555,7 +590,7 @@ def test_merge_with_existing():
         if orchestrator.action_logger:
             orchestrator.action_logger.close()
         
-        # Merge
+        # Merge (auto-accept keeps existing on conflicts)
         merger = OutputMerger(
             staging_dir=staging_dir,
             dry_run=False,
@@ -572,14 +607,29 @@ def test_merge_with_existing():
         assert stats['files_copied'] > 0
         assert stats['errors'] == 0
         
-        # Verify registry was merged (should have both old and new records)
+        # Verify registry was merged correctly
         merged_df = pd.read_excel(reg_dir / "anotaciones.xlsx")
         print(f"  Registry records after merge: {len(merged_df)}")
-        assert len(merged_df) >= 2, f"Expected at least 2 records, got {len(merged_df)}"
+        
+        # LH 99999 (no match in staging) should be preserved.
+        # LH-15083 matched by specimen_id → merged, NOT appended.
+        # So we should have exactly 2 records, not 3.
+        assert len(merged_df) == 2, (
+            f"Expected 2 records (LH 99999 + merged LH-15083), got {len(merged_df)}"
+        )
         
         # Check existing record is preserved
         existing_uuids = merged_df['uuid'].tolist()
         assert "existing-uuid-001" in existing_uuids, "Existing record should be preserved"
+        
+        # Check the matched record kept its existing macroclass (auto_accept
+        # keeps existing on conflicts, and gap-fills are auto-merged).
+        lh_row = merged_df[
+            merged_df['specimen_id'].astype(str).str.replace(r'[\s\-_]', '', regex=True).str.lower() == 'lh15083'
+        ]
+        assert len(lh_row) == 1, f"Expected 1 merged LH-15083 row, got {len(lh_row)}"
+        assert lh_row.iloc[0]['macroclass_label'] == 'Arthropoda', \
+            "Existing macroclass_label should be preserved"
         
         print("\n[PASS] Merge with existing files test passed")
         return True

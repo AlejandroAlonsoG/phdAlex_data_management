@@ -7,6 +7,10 @@
         "/^python -m data_ordering\\.test_phase1; python -m data_ordering\\.test_phase5$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^python -m data_ordering\\.test_phase6 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }

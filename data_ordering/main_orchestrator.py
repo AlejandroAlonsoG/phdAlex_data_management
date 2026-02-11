@@ -1321,6 +1321,46 @@ class PipelineOrchestrator:
         )
         logger.info(f"Found {len(all_groups)} duplicate groups ({dup_count} duplicate files)")
     
+    # ------------------------------------------------------------------
+    # JPEG conversion helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _copy_as_jpeg(source_path: Path, dest_path: Path) -> bool:
+        """Try to convert *source_path* to JPEG and save at *dest_path*.
+
+        Returns True if the conversion succeeded, False if PIL could not
+        open / convert the file (caller should fall back to a raw copy).
+        """
+        from .config import PIL_CONVERTIBLE_EXTENSIONS, JPEG_QUALITY
+
+        if source_path.suffix.lower() not in PIL_CONVERTIBLE_EXTENSIONS:
+            return False
+
+        try:
+            from PIL import Image
+        except ImportError:
+            return False
+
+        try:
+            with Image.open(source_path) as img:
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                elif img.mode == 'L':
+                    img = img.convert('RGB')
+                img.save(dest_path, format='JPEG', quality=JPEG_QUALITY)
+            # Preserve source file timestamps as much as possible
+            import os
+            stat = os.stat(source_path)
+            os.utime(dest_path, (stat.st_atime, stat.st_mtime))
+            return True
+        except Exception as e:
+            logger.debug(
+                f"PIL could not convert {source_path.name} to JPEG, "
+                f"falling back to raw copy: {e}"
+            )
+            return False
+
     def _generate_new_filename(self, pf_data: Dict[str, Any], original_path: Path) -> str:
         """
         Generate new filename following the pattern: <campaign_year>_<specimen_id>_<uuid>.<ext>
@@ -1355,7 +1395,13 @@ class PipelineOrchestrator:
             specimen_id = re.sub(r'_+', '_', specimen_id).strip('_')
         
         # Build new filename
+        # Images are normalised to .jpg on output; keep original
+        # extension only when PIL cannot convert the format.
         extension = original_path.suffix.lower()
+        if pf_data.get('file_type') == 'image':
+            from .config import PIL_CONVERTIBLE_EXTENSIONS
+            if extension in PIL_CONVERTIBLE_EXTENSIONS:
+                extension = '.jpg'
         new_filename = f"{year_str}_{specimen_id}_{file_uuid}{extension}"
         
         return new_filename
@@ -1581,11 +1627,15 @@ class PipelineOrchestrator:
                 reason=" | ".join(reason_parts)
             )
             
-            # Move/copy file
+            # Move/copy file (convert images to .jpg when possible)
             if not self.dry_run:
                 try:
                     dest_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source_path, dest_path)
+                    converted = False
+                    if file_type == FileType.IMAGE:
+                        converted = self._copy_as_jpeg(source_path, dest_path)
+                    if not converted:
+                        shutil.copy2(source_path, dest_path)
                     pf_data['moved'] = True
                     
                     # Log the action
@@ -1726,13 +1776,23 @@ class PipelineOrchestrator:
                 if pf_data.get('specimen_id'):
                     comments.append(f"[AUTO] specimen_id extracted from path/filename")
                 
+                # Accumulate original_paths: if this file has duplicates,
+                # collect all their original_paths into a ';'-separated list.
+                all_orig_paths = [path_str]
+                for dup_info in self.state.processed_files.values():
+                    if dup_info.get('duplicate_of') == path_str:
+                        dup_orig = str(dup_info.get('original_path', ''))
+                        if dup_orig and dup_orig not in all_orig_paths:
+                            all_orig_paths.append(dup_orig)
+                combined_original_path = '; '.join(all_orig_paths)
+                
                 # Get macroclass — None if unknown (no more Unsorted_Macroclass)
                 macroclass = pf_data.get('macroclass') or get_macroclass_folder(pf_data.get('taxonomic_class'))
                 
                 record = ImageRecord(
                     uuid=file_uuid,
                     specimen_id=pf_data.get('specimen_id'),
-                    original_path=path_str,
+                    original_path=combined_original_path,
                     current_path=pf_data.get('destination_path'),
                     macroclass_label=macroclass,
                     class_label=pf_data.get('taxonomic_class'),
