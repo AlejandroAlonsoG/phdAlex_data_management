@@ -26,9 +26,9 @@ MACROCLASSES = {
         'name_es': 'Plantas',
         'folder': 'Botany',
         'classes': frozenset({
-            'Angiosperma', 'Bryophyta', 'Charophyceae', 'Equisetopsida',
+            'Angiosperma', 'Bennettitales', 'Bryophyta', 'Charophyceae', 'Equisetopsida',
             'Eudicotyledoneae', 'Marchantiopsida', 'Pinales', 'Pinopsida',
-            'planta', 'Pteridophyta', 'Pterophyta'
+            'Planta', 'Pteridophyta', 'Pterophyta'
         }),
     },
     'Arthropoda': {
@@ -36,7 +36,7 @@ MACROCLASSES = {
         'name_es': 'Artrópodos',
         'folder': 'Arthropoda',
         'classes': frozenset({
-            'Arachnida', 'Branchiopoda', 'Crustacea', 'Diplopoda',
+            'Arachnida', 'Branchiopoda', 'Coleoptera', 'Crustacea', 'Diplopoda', 'Heteropoda',
             'Insecta', 'Malacostraca', 'Ostracoda'
         }),
     },
@@ -45,7 +45,7 @@ MACROCLASSES = {
         'name_es': 'Moluscos y gusanos',
         'folder': 'Mollusca_Vermes',
         'classes': frozenset({
-            'Bivalvia', 'Clitellata', 'Gastropoda', 'Nematoda'
+            'Bivalvia', 'Clitellata', 'Gastropoda', 'Mollusca', 'Nematoda'
         }),
     },
     'Pisces': {
@@ -53,7 +53,7 @@ MACROCLASSES = {
         'name_es': 'Peces',
         'folder': 'Pisces',
         'classes': frozenset({
-            'Actinopterygii', 'Chondrichthyes', 'Osteichthyes', 'Sarcopterygii'
+            'Actinopterygii', 'Chondrichthyes', 'Lepisosteiforme', 'Osteichthyes', 'Pycnodontiform', 'Sarcopterygii'
         }),
     },
     'Tetrapoda': {
@@ -61,8 +61,8 @@ MACROCLASSES = {
         'name_es': 'Tetrápodos',
         'folder': 'Tetrapoda',
         'classes': frozenset({
-            'Amphibia', ' Amphibia', 'Aves', 'Sauropsida', ' Sauropsida',
-            'Reptilia', 'Tetrapoda', 'Vertebrata'
+            'Amphibia', 'Aves', 'Mammalia', 'Sauropsida', ' Sauropsida',
+            'Reptilia', 'Tetrapoda', 'Testudines', 'Vertebrata'
         }),
     },
     'Ichnofossils': {
@@ -70,7 +70,7 @@ MACROCLASSES = {
         'name_es': 'Icnofósiles',
         'folder': 'Ichnofossils',
         'classes': frozenset({
-            'icnofósil', 'icnofósiles', 'Icnofósil', 'Icnofósiles'
+            'icnofósil', 'icnofósiles', 'Icnofósil', 'Icnofósiles', 'Coprolitos'
         }),
     },
 }
@@ -196,24 +196,14 @@ class Config:
     """Main configuration class."""
     
     # === Source directories ===
-    source_directories: List[Path] = field(default_factory=lambda: [
-        # Add your MUPA and YCLH paths here
-        # Path(r"D:\MUPA"),
-        # Path(r"D:\YCLH"),
-    ])
+    source_directories: List[Path] = field(default_factory=lambda: [])
     
     # === Output directories ===
-    output_base_dir: Path = Path(r"C:\Users\AA.5074193\Desktop\phdAlex_data_management\output")
+    output_base_dir: Optional[Path] = None  # Set by CLI/orchestrator
     output_organized_dir: Path = field(init=False)
     output_text_files_dir: Path = field(init=False)
     output_other_files_dir: Path = field(init=False)
     output_pending_review_dir: Path = field(init=False)
-    
-    def __post_init__(self):
-        self.output_organized_dir = self.output_base_dir / "organized"
-        self.output_text_files_dir = self.output_base_dir / "text_files"
-        self.output_other_files_dir = self.output_base_dir / "other_files"
-        self.output_pending_review_dir = self.output_base_dir / "pending_review"
     
     # === File extensions (reference the module-level sets) ===
     image_extensions: set = field(default_factory=lambda: IMAGE_EXTENSIONS.copy())
@@ -227,7 +217,7 @@ class Config:
     # === LLM Configuration ===
     # Provider: "gemini" or "github"
     llm_provider: str = field(default_factory=lambda: os.environ.get('LLM_PROVIDER', 'github'))
-    llm_requests_per_minute: int = 60  # GitHub Models allows higher RPM
+    llm_requests_per_minute: int = 60  # GitHub Models allows higher RPM TODO sacar a un parámetro en condiciones
     
     # Gemini settings
     gemini_model: str = field(default_factory=lambda: os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash'))
@@ -251,26 +241,18 @@ class Config:
             return self.github_token_env_var
         return self.gemini_api_key_env_var
     
-    # === Specimen ID patterns ===
-    # Pattern: cccc-dddddddd-pp (characters, separator, digits, plate indicator)
-    specimen_id_patterns: List[str] = field(default_factory=lambda: [
-        r'^([A-Za-z]{2,6})[-_\s]?(\d{6,10})[-_\s]?([ab])?$',  # MUPA-12345678-a
-        r'^(\d{6,10})[-_\s]?([ab])?$',  # Just numbers with optional plate
-    ])
-    
-    # === Image standardization ===
-    output_image_format: str = '.jpg'
-    output_image_quality: int = 95
-    
     # === Logging ===
-    log_dir: Path = field(init=False)
+    log_dir: Optional[Path] = field(init=False, default=None)
     
     def __post_init__(self):
-        self.output_organized_dir = self.output_base_dir / "organized"
-        self.output_text_files_dir = self.output_base_dir / "text_files"
-        self.output_other_files_dir = self.output_base_dir / "other_files"
-        self.output_pending_review_dir = self.output_base_dir / "pending_review"
-        self.log_dir = self.output_base_dir / "logs"
+        # Only initialize derived paths if output_base_dir is set
+        if self.output_base_dir:
+            self.output_base_dir = Path(self.output_base_dir)  # Ensure it's a Path object
+            self.output_organized_dir = self.output_base_dir / "organized"
+            self.output_text_files_dir = self.output_base_dir / "text_files"
+            self.output_other_files_dir = self.output_base_dir / "other_files"
+            self.output_pending_review_dir = self.output_base_dir / "pending_review"
+            self.log_dir = self.output_base_dir / "logs"
     
     def get_collection_output_dir(self, collection_code: str) -> Path:
         """Get output directory for a specific collection."""
@@ -295,6 +277,9 @@ class Config:
     
     def ensure_directories_exist(self):
         """Create all output directories if they don't exist."""
+        if not self.output_base_dir:
+            raise ValueError("output_base_dir must be set before creating directories")
+        
         dirs = [
             self.output_base_dir,
             self.output_organized_dir,

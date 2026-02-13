@@ -153,6 +153,23 @@ class FileScanner:
        - Detect collection from prefix/path
     3. Find duplicates
     4. Mark files needing LLM review
+    
+    NOTE: In the production pipeline (PipelineOrchestrator), this scanner is 
+    typically instantiated with hash_images=False and extract_patterns=False
+    to avoid redundant work. The orchestrator has dedicated pipeline stages
+    for pattern extraction (_run_pattern_extraction), hashing (_run_hashing),
+    and deduplication (_run_deduplication) that consume and store results 
+    in the pipeline state. 
+    
+    However, the hashing/pattern/deduplication code is intentionally left here
+    because:
+    - It provides a complete, self-contained scanning utility for standalone use
+    - It enables quick iteration during development/testing
+    - The logic is reusable for batch operations or alternative workflows
+    
+    When using FileScanner standalone (not via PipelineOrchestrator), you can 
+    enable hash_images=True and extract_patterns=True to get a fully 
+    enriched file registry in one pass.
     """
     
     def __init__(
@@ -323,11 +340,13 @@ class FileScanner:
         if self.hash_images and file_type == FileType.IMAGE:
             self._compute_hashes(scanned)
         
-        # Detect collection
-        self._detect_collection(scanned)
-        
-        # Determine if needs LLM review
-        self._check_needs_llm_review(scanned)
+        # Collection detection and LLM-review flagging depend on pattern
+        # extraction results and are only meaningful in standalone mode.
+        # In the pipeline, the orchestrator handles these in dedicated stages
+        # (_run_pattern_extraction, _run_hashing, _run_deduplication).
+        if self.extract_patterns:
+            self._detect_collection(scanned)
+            self._check_needs_llm_review(scanned)
         
         scanned.status = ScanStatus.COMPLETE
         return scanned

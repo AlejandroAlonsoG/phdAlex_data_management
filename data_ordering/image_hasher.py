@@ -37,7 +37,6 @@ class ImageHash:
     file_path: Path
     md5_hash: str                           # Exact content hash
     phash: Optional[str] = None             # Perceptual hash (None if not an image)
-    ahash: Optional[str] = None             # Average hash (alternative)
     file_size: int = 0                      # File size in bytes
     
     def __hash__(self):
@@ -82,7 +81,7 @@ class ImageHasher:
     # Default threshold for "near" duplicates (hamming distance)
     # pHash typically uses 64-bit hashes, so max distance is 64
     # Lower = more similar required
-    NEAR_DUPLICATE_THRESHOLD = 8
+    NEAR_DUPLICATE_THRESHOLD = 8 # TODO sacar esto a un parámetro en condiciones
     
     def __init__(self, phash_threshold: int = None, normalize_images: bool = True):
         """
@@ -184,33 +183,6 @@ class ImageHasher:
             logger.warning(f"Error computing pHash for {file_path}: {e}")
             return None
     
-    def compute_ahash(self, file_path: Path) -> Optional[str]:
-        """
-        Compute average hash (aHash) of an image.
-        Faster but less accurate than pHash.
-        
-        Args:
-            file_path: Path to image file
-            
-        Returns:
-            Hex string of aHash, or None if not an image or error
-        """
-        if not IMAGEHASH_AVAILABLE:
-            return None
-        
-        if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            return None
-        
-        try:
-            with Image.open(file_path) as img:
-                if img.mode not in ('RGB', 'L'):
-                    img = img.convert('RGB')
-                ahash = imagehash.average_hash(img)
-                return str(ahash)
-        except Exception as e:
-            logger.warning(f"Error computing aHash for {file_path}: {e}")
-            return None
-    
     def hash_image(self, file_path: Path, compute_perceptual: bool = True) -> ImageHash:
         """
         Compute all hashes for an image file.
@@ -225,12 +197,8 @@ class ImageHasher:
         md5 = self.compute_md5(file_path)
         
         phash = None
-        ahash = None
         if compute_perceptual:
             phash = self.compute_phash(file_path)
-            # Only compute ahash if phash succeeded (both require image loading)
-            if phash:
-                ahash = self.compute_ahash(file_path)
         
         file_size = file_path.stat().st_size if file_path.exists() else 0
         
@@ -238,7 +206,6 @@ class ImageHasher:
             file_path=file_path,
             md5_hash=md5,
             phash=phash,
-            ahash=ahash,
             file_size=file_size
         )
     
@@ -480,7 +447,6 @@ class HashRegistry:
             str(path): {
                 'md5': h.md5_hash,
                 'phash': h.phash,
-                'ahash': h.ahash,
                 'size': h.file_size,
             }
             for path, h in self._hashes.items()
@@ -499,7 +465,6 @@ class HashRegistry:
                 file_path=path,
                 md5_hash=info.get('md5', ''),
                 phash=info.get('phash'),
-                ahash=info.get('ahash'),
                 file_size=info.get('size', 0)
             )
             self._hashes[path] = img_hash

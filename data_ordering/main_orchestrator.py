@@ -275,7 +275,6 @@ class PipelineOrchestrator:
         output_base: Path = None,  # Alias for output_dir
         state_path: Path = None,
         use_llm: bool = True,
-        dry_run: bool = False,
         interactive: bool = False,  # Legacy parameter
         interaction_mode: str = None,  # New: 'interactive', 'deferred', 'auto_accept', 'step_by_step'
         progress_callback: Callable[[str, int, int], None] = None,
@@ -298,6 +297,8 @@ class PipelineOrchestrator:
             phash_threshold: Threshold for perceptual hash matching
             use_staging: If True, output to staging dir <output>_<source> for validation
         """
+        dry_run = False
+
         self.source_dirs = [Path(d) for d in source_dirs]
         self.final_output_dir = Path(output_base or output_dir) if (output_base or output_dir) else config.output_base_dir
         self.use_staging = use_staging
@@ -329,7 +330,9 @@ class PipelineOrchestrator:
             self._interaction_mode = InteractionMode.DEFERRED
         
         # Initialize components
-        self.file_scanner = FileScanner()
+        # FileScanner only discovers & classifies files; hashing, pattern
+        # extraction, and deduplication are handled by dedicated pipeline stages.
+        self.file_scanner = FileScanner(hash_images=False, extract_patterns=False)
         self.pattern_extractor = PatternExtractor()
         self.image_hasher = ImageHasher()
         self.hash_registry = HashRegistry()

@@ -66,13 +66,6 @@ Examples:
         help='Source directories to scan (can specify multiple)'
     )
     
-    # Mode flags
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Simulate processing without moving files'
-    )
-    
     parser.add_argument(
         '--resume',
         action='store_true',
@@ -116,38 +109,19 @@ Examples:
         '--phash-threshold',
         type=int,
         default=8,
-        help='Perceptual hash threshold for duplicate detection (default: 8)'
-    )
-    
-    parser.add_argument(
-        '--skip-scan',
-        action='store_true',
-        help='Skip scanning (use existing state)'
+        help='Perceptual hash threshold for duplicate detection (default: 8). TODO UNIMPLEMENTED'
     )
     
     parser.add_argument(
         '--skip-hashing',
         action='store_true',
-        help='Skip hash computation (faster but no duplicate detection)'
+        help='Skip hash computation (faster but no duplicate detection). TODO UNIMPLEMENTED'
     )
     
     parser.add_argument(
         '--no-staging',
         action='store_true',
-        help='Write directly to output directory instead of a staging directory'
-    )
-    
-    # Output control
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Enable verbose output'
-    )
-    
-    parser.add_argument(
-        '--quiet', '-q',
-        action='store_true',
-        help='Suppress progress output'
+        help='Write directly to output directory instead of a staging directory. TODO UNIMPLEMENTED'
     )
     
     return parser
@@ -237,24 +211,21 @@ def run_cli(args: argparse.Namespace) -> int:
     
     # Create progress callback
     def progress_callback(stage: str, current: int, total: int):
-        if not args.quiet:
-            pct = (current / total * 100) if total > 0 else 0
-            print(f"\r  {stage}: {current}/{total} ({pct:.1f}%)", end="", flush=True)
-            if current == total:
-                print()
+        pct = (current / total * 100) if total > 0 else 0
+        print(f"\r  {stage}: {current}/{total} ({pct:.1f}%)", end="", flush=True)
+        if current == total:
+            print()
     
     try:
         # Initialize orchestrator
-        if args.verbose:
-            print("Initializing pipeline...")
+        print("Initializing pipeline...")
         
         orchestrator = PipelineOrchestrator(
             source_dirs=[p.resolve() for p in args.source] if args.source else [],
             output_base=args.output.resolve(),
-            dry_run=args.dry_run,
             use_llm=use_llm,
             phash_threshold=args.phash_threshold,
-            progress_callback=None if args.quiet else progress_callback,
+            progress_callback=progress_callback,
             interaction_mode=interaction_mode,
             use_staging=not getattr(args, 'no_staging', False),
         )
@@ -271,16 +242,14 @@ def run_cli(args: argparse.Namespace) -> int:
                 print(f"  Files scanned: {saved.files_scanned}")
         
         # Run pipeline
-        if not args.quiet:
-            print(f"\nSource directories: {[str(p) for p in (args.source or [])]}")
-            print(f"Output directory: {args.output.resolve()}")
-            if not getattr(args, 'no_staging', False) and args.source:
-                print(f"Staging directory: {orchestrator.output_dir}")
-                print(f"  (Results will be written here for validation before merging)")
-            print(f"Dry run: {args.dry_run}")
-            print(f"Use LLM: {use_llm}")
-            print(f"Interaction mode: {interaction_mode}")
-            print()
+        print(f"\nSource directories: {[str(p) for p in (args.source or [])]}")
+        print(f"Output directory: {args.output.resolve()}")
+        if not getattr(args, 'no_staging', False) and args.source:
+            print(f"Staging directory: {orchestrator.output_dir}")
+            print(f"  (Results will be written here for validation before merging)")
+        print(f"Use LLM: {use_llm}")
+        print(f"Interaction mode: {interaction_mode}")
+        print()
         
         orchestrator.run(resume=args.resume)
         
@@ -312,9 +281,8 @@ def run_cli(args: argparse.Namespace) -> int:
         
     except Exception as e:
         print(f"\nError: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return 1
 
 
