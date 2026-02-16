@@ -22,6 +22,7 @@ import time
 import logging
 import json
 import re
+import requests
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
@@ -1109,6 +1110,182 @@ class GeminiClient(BaseLLMClient):
 
 
 # =============================================================================
+# LOCAL LLM CLIENT (LM Studio / llama-cpp-python / any OpenAI-compatible)
+# =============================================================================
+
+class LocalLLMClient(BaseLLMClient):
+    """
+    Client for a locally-hosted LLM via an OpenAI-compatible API.
+
+    Works with LM Studio, llama-cpp-python, ollama, or any server that
+    exposes an OpenAI-compatible ``/v1/chat/completions`` endpoint.
+
+    Default settings target LM Studio at ``http://127.0.0.1:1234/v1``.
+    Override via constructor args, ``config``, or environment variables.
+    """
+
+    def __init__(
+        self,
+        base_url: str = None,
+        model: str = None,
+        api_key: str = None,
+        requests_per_minute: int = None,
+        timeout: float = None,
+    ):
+        super().__init__(requests_per_minute or 120)  # local = no rate-limit concern
+
+        if not OPENAI_AVAILABLE:
+            raise ImportError(
+                "openai package not installed. Install with: pip install openai"
+            )
+
+        self.base_url = (
+            base_url
+            or config.local_llm_base_url
+        )
+        self.model_name = (
+            model
+            or config.local_llm_model
+        )
+        self.timeout = timeout or config.local_llm_timeout
+        _api_key = api_key or config.local_llm_api_key
+
+        # Ensure localhost traffic bypasses any HTTP proxy (e.g. university networks)
+        from urllib.parse import urlparse
+        parsed = urlparse(self.base_url)
+        local_host = parsed.hostname or "127.0.0.1"
+        for var in ("NO_PROXY", "no_proxy"):
+            current = os.environ.get(var, "")
+            if local_host not in current:
+                os.environ[var] = f"{current},{local_host}" if current else local_host
+
+        self.client = OpenAI(
+            base_url=self.base_url,
+            api_key=_api_key,
+            timeout=self.timeout,
+        )
+
+        logger.info(
+            f"Initialized LocalLLMClient: {self.base_url} "
+            f"(model: {self.model_name})"
+        )
+
+    # --------------------------------------------------------------------- API
+    def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
+        """Call the local OpenAI-compatible endpoint.
+
+        If *schema_name* is provided **and** the server supports
+        ``response_format`` with ``json_schema``, structured output is
+        requested.  Otherwise we fall back to ``json_object`` mode and
+        finally to free-text if even that is unsupported.
+        """
+        logger.debug(f"[LLM_REQUEST] schema={schema_name} | prompt={user_prompt[:300]}")
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Try structured output first (LM Studio ≥0.3 supports it)
+        if schema_name and schema_name in _SCHEMAS:
+            schema = _schema_to_openai(_SCHEMAS[schema_name])
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=1024,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                )
+                result = response.choices[0].message.content
+                logger.debug(f"[LLM_RESPONSE] schema={schema_name} | response={result[:500]}")
+                return result
+            except Exception as e:
+                # Server may not support json_schema; fall back gracefully
+                logger.debug(f"Structured output not supported, falling back: {e}")
+
+        # Fallback: request plain JSON
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            # Last resort: no response_format constraint at all
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+
+        result = response.choices[0].message.content
+        if not result:
+            raise ValueError("Empty response from local LLM")
+        logger.debug(f"[LLM_RESPONSE] schema={schema_name} | response={result[:500]}")
+        return result
+
+    # ----------------------------------------------------------- health check
+    def is_server_running(self) -> bool:
+        """Check if the local LLM server is reachable."""
+        try:
+            base = self.base_url.replace("/v1", "")
+            resp = requests.get(f"{base}/health", timeout=5)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        # Fallback: try /v1/models endpoint
+        try:
+            self.client.models.list()
+            return True
+        except Exception:
+            return False
+
+    def get_server_info(self) -> dict:
+        """Return information about the running server and loaded model."""
+        try:
+            models = self.client.models.list()
+            model_list = [m.id for m in models.data]
+            return {
+                "status": "running",
+                "base_url": self.base_url,
+                "models": model_list,
+                "configured_model": self.model_name,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "base_url": self.base_url,
+                "error": str(e),
+            }
+
+    def wait_for_server(self, timeout: float = 60.0, poll_interval: float = 2.0):
+        """Block until the server is reachable (or *timeout* expires)."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.is_server_running():
+                logger.info("Local LLM server is ready")
+                return True
+            logger.info(f"Waiting for server at {self.base_url}...")
+            time.sleep(poll_interval)
+        raise TimeoutError(
+            f"Server at {self.base_url} did not become available "
+            f"within {timeout}s. Make sure LM Studio is running."
+        )
+
+
+# =============================================================================
 # MOCK CLIENT (for testing)
 # =============================================================================
 
@@ -1284,7 +1461,8 @@ def get_llm_client(provider: str = None) -> BaseLLMClient:
     Factory function to get the appropriate LLM client.
     
     Args:
-        provider: "gemini" or "github". If None, uses config.llm_provider
+        provider: "gemini", "github", "local", or "mock".
+                  If None, uses config.llm_provider.
         
     Returns:
         BaseLLMClient subclass instance
@@ -1295,6 +1473,10 @@ def get_llm_client(provider: str = None) -> BaseLLMClient:
         if not OPENAI_AVAILABLE:
             raise ImportError("openai package not installed for GitHub Models.")
         return GitHubModelsClient()
+    elif provider == 'local':
+        if not OPENAI_AVAILABLE:
+            raise ImportError("openai package not installed for Local LLM.")
+        return LocalLLMClient()
     elif provider == 'mock':
         return MockLLMClient()
     else:
@@ -1436,7 +1618,8 @@ def analyze_directory(
         directory_path: Path to analyze
         sample_filenames: Optional sample filenames
         api_key: API key (for Gemini) or token (for GitHub)
-        provider: "gemini" or "github". If None, uses config.llm_provider
+        provider: "gemini", "github", "local", or "mock".
+                  If None, uses config.llm_provider
         
     Returns:
         DirectoryAnalysis

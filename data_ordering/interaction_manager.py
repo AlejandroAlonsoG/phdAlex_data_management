@@ -23,6 +23,8 @@ class DecisionType(Enum):
     """Types of decisions that can be requested."""
     NUMERIC_ID_AMBIGUITY = "numeric_id_ambiguity"  # Is 12345 a specimen ID or camera counter?
     METADATA_CONFLICT = "metadata_conflict"         # Path says X, filename says Y
+    SOURCE_DISCREPANCY = "source_discrepancy"       # Different extraction sources disagree on a field
+    CAMERA_NUMBER_FLAG = "camera_number_flag"       # A numeric ID was flagged as likely camera-generated
     DUPLICATE_DETECTED = "duplicate_detected"       # File is duplicate of another
     DUPLICATE_METADATA_DISCREPANCY = "duplicate_metadata_discrepancy"  # Duplicates have different metadata
     FILENAME_COLLISION = "filename_collision"       # Two files with same destination name
@@ -39,6 +41,7 @@ class DecisionOutcome(Enum):
     DEFER = "defer"             # Move to review folder for later
     CUSTOM = "custom"           # User provided custom value
     MERGE = "merge"             # Merge metadata from multiple sources
+    APPLY_TO_SUBDIRECTORY = "apply_to_subdirectory"  # Apply same choice to all files in subdirectory
 
 
 @dataclass
@@ -160,11 +163,18 @@ class InteractionManager:
         print(f"\n{request.message}")
         
         is_dup_meta = (request.decision_type == DecisionType.DUPLICATE_METADATA_DISCREPANCY)
+        supports_subdir = (request.decision_type in (
+            DecisionType.SOURCE_DISCREPANCY,
+            DecisionType.CAMERA_NUMBER_FLAG,
+        ))
         
         # Show context only for non-table decision types (table is already in the message)
         if request.context and not is_dup_meta:
             print("\nContext:")
             for key, value in request.context.items():
+                # Skip internal keys used by the reconciliation engine
+                if key.startswith('_'):
+                    continue
                 print(f"  {key}: {value}")
         
         print("\nOptions:")
@@ -173,13 +183,15 @@ class InteractionManager:
         
         print(f"  [d] Defer to manual review folder")
         if not is_dup_meta:
-            # s and c are general-purpose; not shown for duplicate metadata
-            # (custom per-field is already option [{last}] above)
             print(f"  [s] Skip this file")
             print(f"  [c] Enter custom value")
+        if supports_subdir:
+            print(f"  [a] Apply chosen option to ALL files in this subdirectory (same field & sources)")
         
         if is_dup_meta:
             valid_keys = f"0-{len(request.options)-1}, d"
+        elif supports_subdir:
+            valid_keys = f"0-{len(request.options)-1}, d, s, c, a"
         else:
             valid_keys = f"0-{len(request.options)-1}, d, s, c"
         
@@ -197,10 +209,26 @@ class InteractionManager:
                     return DecisionResult(outcome=DecisionOutcome.SKIP)
                 elif choice == 'c' and not is_dup_meta:
                     custom = input("Enter custom value: ").strip()
+                    subdir_too = False
+                    if supports_subdir:
+                        subdir_choice = input("Apply this custom value to the whole subdirectory? [y/N]: ").strip().lower()
+                        subdir_too = subdir_choice in ('y', 'yes')
                     return DecisionResult(
-                        outcome=DecisionOutcome.CUSTOM,
+                        outcome=DecisionOutcome.APPLY_TO_SUBDIRECTORY if subdir_too else DecisionOutcome.CUSTOM,
                         custom_value=custom,
                     )
+                elif choice == 'a' and supports_subdir:
+                    # Ask which numbered option to apply to the whole subdirectory
+                    sub_choice = input(f"  Which option to apply to the whole subdirectory? [0-{len(request.options)-1}]: ").strip()
+                    if sub_choice.isdigit():
+                        idx = int(sub_choice)
+                        if 0 <= idx < len(request.options):
+                            return DecisionResult(
+                                outcome=DecisionOutcome.APPLY_TO_SUBDIRECTORY,
+                                selected_option=idx,
+                            )
+                    print("Invalid sub-option. Try again.")
+                    continue
                 elif choice.isdigit():
                     idx = int(choice)
                     if 0 <= idx < len(request.options):
@@ -370,6 +398,8 @@ class InteractionManager:
         folder_map = {
             DecisionType.NUMERIC_ID_AMBIGUITY: "Ambiguous_IDs",
             DecisionType.METADATA_CONFLICT: "Metadata_Conflicts",
+            DecisionType.SOURCE_DISCREPANCY: "Source_Discrepancies",
+            DecisionType.CAMERA_NUMBER_FLAG: "Camera_Number_Review",
             DecisionType.DUPLICATE_DETECTED: "Duplicates_Review",
             DecisionType.DUPLICATE_METADATA_DISCREPANCY: "Duplicate_Metadata_Review",
             DecisionType.FILENAME_COLLISION: "Filename_Collisions",
@@ -604,4 +634,111 @@ def create_unknown_collection_decision(
             "Unknown - move to review",
         ],
         default_option=3,  # Default to unknown
+    )
+
+
+# ---------- Source-discrepancy & camera-number decisions ----------
+
+# Human-friendly labels for the three extraction sources
+SOURCE_LABELS = {
+    'path_llm': 'Path LLM',
+    'filename_llm': 'Filename LLM',
+    'pattern_extractor': 'Pattern Extractor',
+}
+
+
+def create_source_discrepancy_decision(
+    file_path: Path,
+    field_name: str,
+    values_by_source: Dict[str, Any],
+    directory: str,
+) -> DecisionRequest:
+    """Create a decision request when extraction sources disagree on a field.
+
+    Args:
+        file_path: The file whose metadata is in conflict.
+        field_name: Metadata field name (e.g. 'specimen_id', 'campaign_year').
+        values_by_source: Mapping of source key → extracted value.
+        directory: The subdirectory path (used for subdirectory-wide caching).
+
+    Returns:
+        DecisionRequest with one numbered option per source value, plus a
+        custom-value option.  The user can also choose [a] to apply the
+        decision to the entire subdirectory.
+    """
+    # Build a readable table
+    lines = []
+    source_keys = list(values_by_source.keys())
+    for src_key in source_keys:
+        label = SOURCE_LABELS.get(src_key, src_key)
+        lines.append(f"  {label}: {values_by_source[src_key]}")
+    value_table = "\n".join(lines)
+
+    options = []
+    for src_key in source_keys:
+        label = SOURCE_LABELS.get(src_key, src_key)
+        options.append(f"Use {label} value: {values_by_source[src_key]}")
+    options.append("Leave field empty")
+    options.append("Enter a custom value")
+
+    return DecisionRequest(
+        decision_type=DecisionType.SOURCE_DISCREPANCY,
+        file_path=file_path,
+        message=(
+            f"Discrepancy on field '{field_name}' for file {file_path.name}:\n"
+            f"{value_table}\n\n"
+            f"Choose which value to keep, or press [a] to apply the same "
+            f"choice to every file in this subdirectory with the same conflict."
+        ),
+        context={
+            'field_name': field_name,
+            'values_by_source': values_by_source,
+            'directory': directory,
+            # internal keys prefixed with _ are hidden in the CLI context display
+            '_source_keys': source_keys,
+        },
+        options=options,
+        default_option=0,
+    )
+
+
+def create_camera_number_decision(
+    file_path: Path,
+    numeric_id: str,
+    raw_match: str,
+    directory: str,
+) -> DecisionRequest:
+    """Create a decision request for a numeric ID flagged as likely camera-generated.
+
+    Args:
+        file_path: The file containing the flagged number.
+        numeric_id: The numeric value extracted.
+        raw_match: The raw text that matched the camera pattern.
+        directory: The subdirectory path (for subdirectory-wide caching).
+
+    Returns:
+        DecisionRequest.  The user can choose to use the value as-is, discard
+        it, enter a custom value, or apply the decision to the whole
+        subdirectory.
+    """
+    return DecisionRequest(
+        decision_type=DecisionType.CAMERA_NUMBER_FLAG,
+        file_path=file_path,
+        message=(
+            f"The numeric ID '{numeric_id}' (matched as '{raw_match}') in file "
+            f"'{file_path.name}' looks like a camera-generated number.\n\n"
+            f"Choose what to do, or press [a] to apply the same choice to all "
+            f"files in this subdirectory with the same flag."
+        ),
+        context={
+            'numeric_id': numeric_id,
+            'raw_match': raw_match,
+            'directory': directory,
+        },
+        options=[
+            f"Use '{numeric_id}' as specimen ID anyway",
+            "Discard — leave specimen ID empty",
+            "Enter a custom specimen ID",
+        ],
+        default_option=1,  # Default: discard (safer)
     )

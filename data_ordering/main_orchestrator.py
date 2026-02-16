@@ -31,7 +31,9 @@ from .interaction_manager import (
     DecisionRequest, DecisionResult,
     create_numeric_id_decision, create_metadata_conflict_decision,
     create_duplicate_decision, create_duplicate_metadata_decision,
-    create_unknown_collection_decision
+    create_unknown_collection_decision,
+    create_source_discrepancy_decision, create_camera_number_decision,
+    SOURCE_LABELS,
 )
 
 
@@ -44,6 +46,7 @@ class PipelineStage(Enum):
     SCANNING = "scanning"
     LLM_ANALYSIS = "llm_analysis"
     PATTERN_EXTRACTION = "pattern_extraction"
+    METADATA_RECONCILIATION = "metadata_reconciliation"
     HASHING = "hashing"
     DEDUPLICATION = "deduplication"
     REGISTRY_GENERATION = "registry_generation"  # Log to Excel FIRST
@@ -224,11 +227,19 @@ class PipelineOrchestrator:
     Pipeline stages:
     1. SCANNING: Walk directories and discover all files
     2. LLM_ANALYSIS: Analyze directories with LLM (one call per directory)
-    3. PATTERN_EXTRACTION: Extract specimen IDs using LLM-provided regex
-    4. HASHING: Compute MD5 and perceptual hashes for images
-    5. DEDUPLICATION: Identify and group duplicates
-    6. ORGANIZING: Move files to collection-based folders (with renaming)
-    7. REGISTRY_GENERATION: Create Excel registries
+       2a. PATH ANALYSIS — extract taxonomy, year, collection from directory path
+       2b. REGEX GENERATION — LLM generates regex for filenames
+       2c. REGEX APPLICATION — apply regex to every file
+       2d. PER-FILE FALLBACK — individual LLM call for unmatched files
+    3. PATTERN_EXTRACTION: Extract specimen IDs using predefined heuristic patterns
+    4. METADATA_RECONCILIATION: Compare metadata from all sources (Path LLM,
+       Filename LLM, Pattern Extractor), detect discrepancies, prompt the user
+       to resolve them (with option to apply same resolution to whole
+       subdirectory).  Also handles camera-number flags.
+    5. HASHING: Compute MD5 and perceptual hashes for images
+    6. DEDUPLICATION: Identify and group duplicates
+    7. ORGANIZING: Move files to collection-based folders (with renaming)
+    8. REGISTRY_GENERATION: Create Excel registries
     
     File handling:
     - Images: Las Hoyas (default) at root: Campaign/Macroclass/Class/Determination
@@ -365,8 +376,9 @@ class PipelineOrchestrator:
                 provider = config.llm_provider
                 can_use_llm = (
                     (provider == 'github' and OPENAI_AVAILABLE) or
+                    (provider == 'local' and OPENAI_AVAILABLE) or
                     (provider == 'gemini' and GENAI_AVAILABLE) or
-                    (provider not in ('github', 'gemini') and (GENAI_AVAILABLE or OPENAI_AVAILABLE))
+                    (provider not in ('github', 'gemini', 'local') and (GENAI_AVAILABLE or OPENAI_AVAILABLE))
                 )
                 
                 if can_use_llm:
@@ -462,6 +474,11 @@ class PipelineOrchestrator:
             if self.state.stage == PipelineStage.PATTERN_EXTRACTION:
                 self._run_pattern_extraction()
                 if not self._confirm_stage_completion("PATTERN_EXTRACTION"):
+                    return self.state
+            
+            if self.state.stage == PipelineStage.METADATA_RECONCILIATION:
+                self._run_metadata_reconciliation()
+                if not self._confirm_stage_completion("METADATA_RECONCILIATION"):
                     return self.state
             
             if self.state.stage == PipelineStage.HASHING:
@@ -572,6 +589,30 @@ class PipelineOrchestrator:
             }
             sample_items = [
                 {'file': v.get('filename'), 'specimen_id': v.get('specimen_id'), 'class': v.get('taxonomic_class')}
+                for v in list(self.state.processed_files.values())[:10]
+            ]
+            
+        elif stage_name == "METADATA_RECONCILIATION":
+            description = "Compared metadata from Path LLM / Filename LLM / Pattern Extractor and resolved discrepancies"
+            needs_review = sum(1 for v in self.state.processed_files.values() if v.get('needs_review'))
+            # Count files that had metadata_sources with >1 source on any field
+            files_with_multi = 0
+            for v in self.state.processed_files.values():
+                msrc = v.get('metadata_sources', {})
+                if any(len(src_vals) > 1 for src_vals in msrc.values()):
+                    files_with_multi += 1
+            summary_data = {
+                'Files with multi-source metadata': files_with_multi,
+                'Files flagged for review': needs_review,
+            }
+            sample_items = [
+                {
+                    'file': v.get('filename'),
+                    'specimen_id': v.get('specimen_id'),
+                    'campaign_year': v.get('campaign_year'),
+                    'class': v.get('taxonomic_class'),
+                    'needs_review': v.get('needs_review', False),
+                }
                 for v in list(self.state.processed_files.values())[:10]
             ]
             
@@ -927,34 +968,55 @@ class PipelineOrchestrator:
                 filename = Path(path_str).name
                 pf_data = self.state.processed_files.get(path_str, {})
                 
-                # Apply path-level metadata
-                if path_analysis:
-                    if path_analysis.macroclass:
-                        pf_data['macroclass'] = path_analysis.macroclass
-                    if path_analysis.taxonomic_class:
-                        pf_data['taxonomic_class'] = path_analysis.taxonomic_class
-                    if path_analysis.genus:
-                        pf_data['determination'] = path_analysis.genus
-                    if path_analysis.collection_code and path_analysis.collection_code != 'unknown':
-                        pf_data['collection_code'] = path_analysis.collection_code
-                    if path_analysis.campaign_year:
-                        pf_data['campaign_year'] = path_analysis.campaign_year
+                # Ensure metadata_sources dict exists (field -> {source -> value})
+                if 'metadata_sources' not in pf_data:
+                    pf_data['metadata_sources'] = {}
+                msrc = pf_data['metadata_sources']
                 
-                # Apply regex-extracted data
+                # --- Helper to record a value from a given source ---
+                def _record(field: str, value, source: str):
+                    """Store *value* under *field* for *source* and set the
+                    top-level pf_data[field] (last-writer-wins for now; the
+                    reconciliation stage will resolve conflicts)."""
+                    if value is None:
+                        return
+                    if field not in msrc:
+                        msrc[field] = {}
+                    msrc[field][source] = value
+                    pf_data[field] = value
+                
+                # Apply path-level metadata (source: path_llm)
+                if path_analysis:
+                    _record('macroclass', path_analysis.macroclass, 'path_llm')
+                    _record('taxonomic_class', path_analysis.taxonomic_class, 'path_llm')
+                    _record('determination', path_analysis.genus, 'path_llm')
+                    if path_analysis.collection_code and path_analysis.collection_code != 'unknown':
+                        _record('collection_code', path_analysis.collection_code, 'path_llm')
+                    _record('campaign_year', path_analysis.campaign_year, 'path_llm')
+                
+                # Apply regex-extracted data (source: filename_llm)
                 if filename in successes:
                     extracted = successes[filename]
                     if 'specimen_id' in extracted:
-                        pf_data['specimen_id'] = extracted['specimen_id']
+                        _record('specimen_id', extracted['specimen_id'], 'filename_llm')
                     if 'campaign_year' in extracted:
-                        pf_data['campaign_year'] = extracted['campaign_year']
+                        _record('campaign_year', extracted['campaign_year'], 'filename_llm')
+                    # Carry over any other fields the regex extracted
+                    for ex_field in ('macroclass', 'taxonomic_class', 'determination'):
+                        if ex_field in extracted:
+                            _record(ex_field, extracted[ex_field], 'filename_llm')
                 
-                # Apply per-file fallback data
+                # Apply per-file fallback data (source: filename_llm — same logical source)
                 if filename in file_analyses:
                     fa = file_analyses[filename]
-                    if fa.get('specimen_id') and not pf_data.get('specimen_id'):
-                        pf_data['specimen_id'] = fa['specimen_id']
-                    if fa.get('campaign_year') and not pf_data.get('campaign_year'):
-                        pf_data['campaign_year'] = fa['campaign_year']
+                    if fa.get('specimen_id'):
+                        _record('specimen_id', fa['specimen_id'], 'filename_llm')
+                    if fa.get('campaign_year'):
+                        _record('campaign_year', fa['campaign_year'], 'filename_llm')
+                    if fa.get('taxonomic_class'):
+                        _record('taxonomic_class', fa['taxonomic_class'], 'filename_llm')
+                    if fa.get('determination') or fa.get('genus'):
+                        _record('determination', fa.get('determination') or fa.get('genus'), 'filename_llm')
                 
                 self.state.processed_files[path_str] = pf_data
             
@@ -987,7 +1049,12 @@ class PipelineOrchestrator:
         logger.info(f"Analyzed {len(directories)} directories")
     
     def _run_pattern_extraction(self):
-        """Stage 3: Extract patterns - known patterns first, then LLM regex if needed."""
+        """Stage 3: Extract patterns - known patterns first, then LLM regex if needed.
+        
+        Records all extracted values into pf_data['metadata_sources'] so that
+        the METADATA_RECONCILIATION stage can compare them and ask the user to
+        resolve discrepancies.
+        """
         logger.info("Stage 3: Extracting patterns...")
         self.action_logger.stage_start("PATTERN_EXTRACTION", f"{len(self.state.processed_files)} files to process")
         self.state.stage = PipelineStage.PATTERN_EXTRACTION
@@ -996,18 +1063,35 @@ class PipelineOrchestrator:
         ids_from_known = 0
         ids_from_llm = 0
         ids_missing = 0
+        camera_flags = 0
         
         for i, (path_str, pf_data) in enumerate(self.state.processed_files.items()):
             path = Path(path_str)
             dir_path = str(path.parent)
             
+            # Ensure metadata_sources dict exists
+            if 'metadata_sources' not in pf_data:
+                pf_data['metadata_sources'] = {}
+            msrc = pf_data['metadata_sources']
+            
+            def _record_pe(field: str, value):
+                """Record a value from the pattern_extractor source."""
+                if value is None:
+                    return
+                if field not in msrc:
+                    msrc[field] = {}
+                msrc[field]['pattern_extractor'] = value
+                pf_data[field] = value
+            
             # Get directory analysis
             dir_analysis = self.state.directory_analyses.get(dir_path, {})
             
-            # PRIORITY 1: Try known pattern extractor first (regex-based, no LLM)
+            # Run the full heuristic extractor
             result = self.pattern_extractor.extract(path)
+            
+            # --- Specimen ID ---
             if result.specimen_id:
-                pf_data['specimen_id'] = result.specimen_id.specimen_id  # Use specimen_id attribute
+                _record_pe('specimen_id', result.specimen_id.specimen_id)
                 logger.debug(f"Specimen ID from known pattern: {result.specimen_id.specimen_id}")
                 self.action_logger.specimen_id_found(
                     path.name, result.specimen_id.specimen_id, source="known_pattern"
@@ -1034,29 +1118,56 @@ class PipelineOrchestrator:
                     reason="no_known_pattern_and_no_llm_regex"
                 )
             
-            # Apply directory-level metadata
+            # --- Camera-number flags ---
+            # Store numeric IDs flagged as camera-generated so reconciliation
+            # can prompt the user.
+            cam_ids = [n for n in result.numeric_ids if n.is_likely_camera_number]
+            if cam_ids:
+                camera_flags += 1
+                pf_data['camera_number_flags'] = [
+                    {'numeric_id': n.numeric_id, 'raw_match': n.raw_match}
+                    for n in cam_ids
+                ]
+            
+            # --- Campaign year from heuristic date extraction ---
+            best_date = result.get_best_date()
+            if best_date:
+                _record_pe('campaign_year', best_date.year)
+            
+            # --- Taxonomy hints from path ---
+            for hint in result.taxonomy_hints:
+                if hint.level == 'class':
+                    _record_pe('taxonomic_class', hint.value)
+                elif hint.level in ('genus', 'order', 'family'):
+                    _record_pe('determination', hint.value)
+            
+            # --- Campaign from path analyzer ---
+            if result.campaign and not pf_data.get('campaign_year'):
+                _record_pe('campaign_year', result.campaign.year)
+            
+            # Apply directory-level metadata (these are already recorded as
+            # path_llm in the LLM stage; no need to re-record source here,
+            # just ensure the top-level field is populated).
             if dir_analysis.get('collection_code'):
                 pf_data['collection_code'] = dir_analysis['collection_code']
             elif not pf_data.get('collection_code'):
-                # Try to detect from path
                 collection = detect_collection(path)
                 if collection:
                     pf_data['collection_code'] = collection
             
-            # Log collection detection
             if pf_data.get('collection_code'):
                 self.action_logger.collection_detected(
                     path.name, pf_data['collection_code'],
                     source="dir_analysis" if dir_analysis.get('collection_code') else "path_detection"
                 )
             
-            if dir_analysis.get('taxonomic_class'):
+            if dir_analysis.get('taxonomic_class') and not pf_data.get('taxonomic_class'):
                 pf_data['taxonomic_class'] = dir_analysis['taxonomic_class']
             
-            if dir_analysis.get('determination'):
+            if dir_analysis.get('determination') and not pf_data.get('determination'):
                 pf_data['determination'] = dir_analysis['determination']
             
-            if dir_analysis.get('campaign_year'):
+            if dir_analysis.get('campaign_year') and not pf_data.get('campaign_year'):
                 pf_data['campaign_year'] = dir_analysis['campaign_year']
             
             # Log full metadata summary for this file
@@ -1071,18 +1182,348 @@ class PipelineOrchestrator:
             
             self._report_progress("Pattern Extraction", i + 1, total)
         
-        self.state.stage = PipelineStage.HASHING
+        self.state.stage = PipelineStage.METADATA_RECONCILIATION
         self._save_state()
         
         self.action_logger.stage_end(
             "PATTERN_EXTRACTION",
-            f"IDs from known patterns: {ids_from_known} | IDs from LLM regex: {ids_from_llm} | Missing: {ids_missing}"
+            f"IDs from known patterns: {ids_from_known} | IDs from LLM regex: {ids_from_llm} | "
+            f"Missing: {ids_missing} | Camera flags: {camera_flags}"
         )
         logger.info("Pattern extraction complete")
     
+    # ------------------------------------------------------------------
+    # Fields eligible for source-discrepancy reconciliation
+    # ------------------------------------------------------------------
+    RECONCILABLE_FIELDS = (
+        'specimen_id', 'campaign_year', 'macroclass',
+        'taxonomic_class', 'determination',
+    )
+
+    # Priority ordering for automatic (non-interactive) conflict resolution.
+    # First source in the list wins.  Sources not listed are ignored.
+    FIELD_SOURCE_PRIORITY: Dict[str, List[str]] = {
+        'specimen_id':     ['pattern_extractor', 'filename_llm', 'path_llm'],
+        'campaign_year':   ['path_llm', 'pattern_extractor', 'filename_llm'],
+        'macroclass':      ['path_llm', 'filename_llm', 'pattern_extractor'],
+        'taxonomic_class': ['path_llm', 'filename_llm', 'pattern_extractor'],
+        'determination':   ['path_llm', 'filename_llm', 'pattern_extractor'],
+    }
+
+    def _auto_resolve_discrepancy(
+        self,
+        field_name: str,
+        source_values: Dict[str, Any],
+    ) -> str:
+        """Pick the winning source key for *field_name* using FIELD_SOURCE_PRIORITY.
+
+        Returns the source key whose value should be used.  If none of the
+        sources appear in the priority list the first source is returned as
+        a fallback.
+        """
+        priority = self.FIELD_SOURCE_PRIORITY.get(field_name, [])
+        for src in priority:
+            if src in source_values and source_values[src] is not None:
+                return src
+        # Fallback: first available source
+        return next(iter(source_values))
+
+    def _run_metadata_reconciliation(self):
+        """Stage 4: Reconcile metadata from different extraction sources.
+        
+        For every file, compares the values contributed by each source
+        (path_llm, filename_llm, pattern_extractor).  When two or more
+        sources disagree on a field:
+        
+        * **Interactive / step-by-step modes** → the user is prompted to
+          pick the authoritative value (with an option to apply the same
+          choice to the whole subdirectory).
+        * **Non-interactive modes** (deferred, auto_accept) → the conflict
+          is resolved automatically using ``FIELD_SOURCE_PRIORITY`` which
+          defines a per-field ordering of trusted sources.
+        
+        Camera-number flags follow the same logic: interactive prompts the
+        user, non-interactive discards them (safer default).
+        """
+        logger.info("Stage 4: Reconciling metadata sources...")
+        self.action_logger.stage_start(
+            "METADATA_RECONCILIATION",
+            f"{len(self.state.processed_files)} files to reconcile"
+        )
+        self.state.stage = PipelineStage.METADATA_RECONCILIATION
+        
+        total = len(self.state.processed_files)
+        discrepancies_found = 0
+        discrepancies_resolved = 0
+        auto_resolved = 0
+        camera_prompts = 0
+        
+        is_interactive = self.interaction_manager.mode in (
+            InteractionMode.INTERACTIVE, InteractionMode.STEP_BY_STEP,
+        )
+        
+        # Cache of subdirectory-level resolutions.
+        # Key: (directory, field_name, frozenset(source_keys))
+        # Value: chosen source key (str) | None (empty) | ('custom', value)
+        subdir_resolutions: Dict[tuple, Any] = {}
+        
+        # Cache for camera-number subdirectory decisions.
+        # Key: directory
+        # Value: 'use' | 'discard' | ('custom', value)
+        subdir_camera_decisions: Dict[str, Any] = {}
+        
+        # --- 1. Source-discrepancy resolution ---
+        for i, (path_str, pf_data) in enumerate(self.state.processed_files.items()):
+            path = Path(path_str)
+            dir_path = str(path.parent)
+            msrc = pf_data.get('metadata_sources', {})
+            
+            for field_name in self.RECONCILABLE_FIELDS:
+                source_values = msrc.get(field_name, {})
+                if len(source_values) < 2:
+                    continue  # 0 or 1 source → no conflict
+                
+                # Check if all sources agree
+                unique_values = set(str(v) for v in source_values.values())
+                if len(unique_values) <= 1:
+                    continue  # All sources agree
+                
+                discrepancies_found += 1
+                
+                source_keys_frozen = frozenset(source_values.keys())
+                cache_key = (dir_path, field_name, source_keys_frozen)
+                
+                # Check subdirectory-level cache first
+                if cache_key in subdir_resolutions:
+                    cached = subdir_resolutions[cache_key]
+                    self._apply_cached_resolution(
+                        pf_data, field_name, source_values, cached
+                    )
+                    discrepancies_resolved += 1
+                    continue
+                
+                # --- Non-interactive: auto-resolve via priority ---
+                if not is_interactive:
+                    winner = self._auto_resolve_discrepancy(
+                        field_name, source_values
+                    )
+                    pf_data[field_name] = source_values[winner]
+                    auto_resolved += 1
+                    discrepancies_resolved += 1
+                    logger.debug(
+                        f"Auto-resolved {field_name} for {path.name}: "
+                        f"chose {winner} = {source_values[winner]}"
+                    )
+                    self.action_logger.info(
+                        f"Auto-resolved {field_name} for {path.name}: "
+                        f"{winner} → {source_values[winner]}  "
+                        f"(other: {', '.join(f'{k}={v}' for k, v in source_values.items() if k != winner)})"
+                    )
+                    continue
+                
+                # --- Interactive: ask the user ---
+                decision_req = create_source_discrepancy_decision(
+                    file_path=path,
+                    field_name=field_name,
+                    values_by_source=source_values,
+                    directory=dir_path,
+                )
+                result = self.interaction_manager.request_decision(decision_req)
+                
+                resolution = self._interpret_discrepancy_result(
+                    result, source_values, list(source_values.keys())
+                )
+                
+                # Apply to this file
+                self._apply_cached_resolution(
+                    pf_data, field_name, source_values, resolution
+                )
+                discrepancies_resolved += 1
+                
+                # If subdirectory-wide, cache the resolution
+                if result.outcome == DecisionOutcome.APPLY_TO_SUBDIRECTORY:
+                    subdir_resolutions[cache_key] = resolution
+                    logger.info(
+                        f"Cached subdirectory resolution for "
+                        f"{Path(dir_path).name}/{field_name}: {resolution}"
+                    )
+                
+                # If deferred, flag for review
+                if result.outcome == DecisionOutcome.DEFER:
+                    pf_data['needs_review'] = True
+                    pf_data['review_reason'] = (
+                        f"Discrepancia_{field_name}"
+                    )
+            
+            self._report_progress("Metadata Reconciliation", i + 1, total)
+        
+        # --- 2. Camera-number flag resolution ---
+        for path_str, pf_data in self.state.processed_files.items():
+            cam_flags = pf_data.get('camera_number_flags')
+            if not cam_flags:
+                continue
+            
+            path = Path(path_str)
+            dir_path = str(path.parent)
+            
+            for cam_entry in cam_flags:
+                numeric_id = cam_entry['numeric_id']
+                raw_match = cam_entry['raw_match']
+                
+                camera_prompts += 1
+                
+                # --- Non-interactive: auto-discard camera numbers ---
+                if not is_interactive:
+                    self._apply_camera_resolution(pf_data, numeric_id, 'discard')
+                    logger.debug(
+                        f"Auto-discarded camera number '{numeric_id}' "
+                        f"(raw: '{raw_match}') for {path.name}"
+                    )
+                    continue
+                
+                # Check subdirectory cache
+                if dir_path in subdir_camera_decisions:
+                    cached = subdir_camera_decisions[dir_path]
+                    self._apply_camera_resolution(pf_data, numeric_id, cached)
+                    continue
+                
+                # --- Interactive: ask the user ---
+                decision_req = create_camera_number_decision(
+                    file_path=path,
+                    numeric_id=numeric_id,
+                    raw_match=raw_match,
+                    directory=dir_path,
+                )
+                result = self.interaction_manager.request_decision(decision_req)
+                
+                cam_resolution = self._interpret_camera_result(result, numeric_id)
+                self._apply_camera_resolution(pf_data, numeric_id, cam_resolution)
+                
+                # Cache if subdirectory-wide
+                if result.outcome == DecisionOutcome.APPLY_TO_SUBDIRECTORY:
+                    subdir_camera_decisions[dir_path] = cam_resolution
+                    logger.info(
+                        f"Cached subdirectory camera decision for "
+                        f"{Path(dir_path).name}: {cam_resolution}"
+                    )
+                
+                if result.outcome == DecisionOutcome.DEFER:
+                    pf_data['needs_review'] = True
+                    pf_data['review_reason'] = (
+                        f"Numero_camara_{numeric_id}"
+                    )
+            
+            # Clean up transient flag now that it has been processed
+            pf_data.pop('camera_number_flags', None)
+        
+        self.state.stage = PipelineStage.HASHING
+        self._save_state()
+        
+        self.action_logger.stage_end(
+            "METADATA_RECONCILIATION",
+            f"Discrepancies found: {discrepancies_found} | Resolved: {discrepancies_resolved} | "
+            f"Auto-resolved: {auto_resolved} | Camera prompts: {camera_prompts}"
+        )
+        logger.info(
+            f"Metadata reconciliation complete — "
+            f"{discrepancies_found} discrepancies ({auto_resolved} auto-resolved), "
+            f"{camera_prompts} camera flags"
+        )
+    
+    # ------------------------------------------------------------------
+    # Reconciliation helpers
+    # ------------------------------------------------------------------
+    
+    @staticmethod
+    def _interpret_discrepancy_result(
+        result: DecisionResult,
+        source_values: Dict[str, Any],
+        source_keys: list,
+    ) -> Any:
+        """Convert a DecisionResult into a cacheable resolution token.
+        
+        Returns one of:
+            - source_key (str): use that source's value
+            - None: leave field empty
+            - ('custom', value): use an explicit custom value
+        """
+        if result.outcome in (DecisionOutcome.ACCEPT, DecisionOutcome.APPLY_TO_SUBDIRECTORY):
+            idx = result.selected_option if result.selected_option is not None else 0
+            if idx < len(source_keys):
+                return source_keys[idx]  # chosen source
+            elif idx == len(source_keys):
+                return None  # "Leave field empty"
+            else:
+                # "Enter a custom value" — fall through to custom
+                pass
+        
+        if result.outcome in (DecisionOutcome.CUSTOM, DecisionOutcome.APPLY_TO_SUBDIRECTORY):
+            if result.custom_value is not None:
+                return ('custom', result.custom_value)
+        
+        if result.outcome == DecisionOutcome.SKIP:
+            return None
+        
+        # DEFER — leave as-is (last-writer-wins already applied)
+        return '__defer__'
+    
+    @staticmethod
+    def _apply_cached_resolution(
+        pf_data: dict,
+        field_name: str,
+        source_values: Dict[str, Any],
+        resolution,
+    ):
+        """Apply a resolution token to *pf_data[field_name]*."""
+        if resolution == '__defer__':
+            return  # leave current value
+        if resolution is None:
+            pf_data[field_name] = None
+        elif isinstance(resolution, tuple) and resolution[0] == 'custom':
+            pf_data[field_name] = resolution[1]
+        elif isinstance(resolution, str) and resolution in source_values:
+            pf_data[field_name] = source_values[resolution]
+        # else: unexpected — leave as-is
+    
+    @staticmethod
+    def _interpret_camera_result(result: DecisionResult, numeric_id: str) -> Any:
+        """Convert a camera-flag DecisionResult into a cacheable token.
+        
+        Returns:
+            - 'use': keep the numeric_id as specimen_id
+            - 'discard': leave specimen_id untouched (don't use camera number)
+            - ('custom', value): use a custom specimen_id
+        """
+        if result.outcome in (DecisionOutcome.ACCEPT, DecisionOutcome.APPLY_TO_SUBDIRECTORY):
+            idx = result.selected_option if result.selected_option is not None else 1
+            if idx == 0:
+                return 'use'
+            elif idx == 1:
+                return 'discard'
+            elif idx == 2 and result.custom_value:
+                return ('custom', result.custom_value)
+        
+        if result.outcome == DecisionOutcome.CUSTOM and result.custom_value:
+            return ('custom', result.custom_value)
+        
+        # Default: discard
+        return 'discard'
+    
+    @staticmethod
+    def _apply_camera_resolution(pf_data: dict, numeric_id: str, resolution):
+        """Apply a camera-flag resolution to *pf_data*."""
+        if resolution == 'use':
+            # Only set specimen_id if not already populated by a proper pattern
+            if not pf_data.get('specimen_id'):
+                pf_data['specimen_id'] = numeric_id
+        elif resolution == 'discard':
+            pass  # Do nothing — camera number is ignored
+        elif isinstance(resolution, tuple) and resolution[0] == 'custom':
+            pf_data['specimen_id'] = resolution[1]
+
     def _run_hashing(self):
-        """Stage 4: Compute hashes for images."""
-        logger.info("Stage 4: Computing hashes...")
+        """Stage 5: Compute hashes for images."""
+        logger.info("Stage 5: Computing hashes...")
         self.state.stage = PipelineStage.HASHING
         
         # Filter to only image files
@@ -1176,8 +1617,8 @@ class PipelineOrchestrator:
         logger.info(f"Hashed {total} files")
     
     def _run_deduplication(self):
-        """Stage 5: Identify duplicates."""
-        logger.info("Stage 5: Identifying duplicates...")
+        """Stage 6: Identify duplicates."""
+        logger.info("Stage 6: Identifying duplicates...")
         self.action_logger.stage_start("DEDUPLICATION")
         self.state.stage = PipelineStage.DEDUPLICATION
         
@@ -1553,12 +1994,12 @@ class PipelineOrchestrator:
         return dest_dir, new_filename
     
     def _run_organizing(self):
-        """Stage 6: Organize files into collection folders with renaming.
+        """Stage 7: Organize files into collection folders with renaming.
         
         NOTE: This runs BEFORE registry generation, so current_path in the 
         registry reflects the final destination of each file.
         """
-        logger.info("Stage 6: Organizing files (moving to final destinations)...")
+        logger.info("Stage 7: Organizing files (moving to final destinations)...")
         self.action_logger.stage_start("ORGANIZING", f"dry_run={self.dry_run}")
         self.state.stage = PipelineStage.ORGANIZING
         
@@ -1697,14 +2138,14 @@ class PipelineOrchestrator:
             logger.info(f"Cleaned up {deleted_count} empty directories")
     
     def _run_registry_generation(self):
-        """Stage 7: Generate Excel registries for images, text files, and other files.
+        """Stage 8: Generate Excel registries for images, text files, and other files.
         
         IMPORTANT: This runs AFTER organizing (file move) so that current_path
         reflects the final destination of each file.
         Duplicates are NOT included in anotaciones.xlsx — they get their own
         registry file inside the Duplicados folder.
         """
-        logger.info("Stage 7: Generating registries (logging to Excel AFTER file move)...")
+        logger.info("Stage 8: Generating registries (logging to Excel AFTER file move)...")
         self.action_logger.stage_start("REGISTRY_GENERATION")
         self.state.stage = PipelineStage.REGISTRY_GENERATION
         

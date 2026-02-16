@@ -24,7 +24,7 @@ class SpecimenIdMatch:
     specimen_id: str  # The extracted ID (format: cccc-dddddddd-pp)
     prefix: str       # The 4-char prefix (e.g., MUPA, YCLH)
     numeric_part: str # The 8-digit number
-    plate: Optional[str]  # The plate indicator (a, b, c... or 01, 02...)
+    plate: Optional[str]  # The plate indicator (a, b, ab, AB only)
     source: PatternSource
     confidence: float  # 0.0 to 1.0
     raw_match: str    # The original matched text
@@ -109,7 +109,7 @@ class SpecimenIdExtractor:
     Where:
         prefix = 2-8 character prefix (LH, MUPA, YCLH, MCCM, MCCM-LH, K-Bue, Cer-Bue, PB)
         numeric = 3-8 digit numeric ID (variable length)
-        plate = optional plate indicator (a, b, AB, (1), (23), etc.)
+        plate = optional plate indicator, only valid values: a, A, b, B, ab, aB, Ab, AB
     
     Handles real-world variations:
         - LH-15083_a_.jpg, LH-6120.jpg (variable digit lengths)
@@ -117,7 +117,7 @@ class SpecimenIdExtractor:
         - LH32560AB.JPG (no separator between prefix and number)
         - MCCM-LH 26452A.JPG (compound prefixes)
         - PB 7005b.JPG (PB prefix - not a camera code!)
-        - K-Bue 085 (1).JPG (hyphenated prefixes, parenthetical sequences)
+        - K-Bue 085.JPG (hyphenated prefixes)
         - Cer-Bue 001a.JPG (longer hyphenated prefixes)
     """
     
@@ -156,23 +156,23 @@ class SpecimenIdExtractor:
         
         # Full pattern: PREFIX + optional separator + 3-8 digits + optional plate
         # Separator can be: hyphen, underscore, space, or nothing (attached)
-        # Plate can be: a-z letter, two letters (AB), digits, or (N) format
+        # Plate can only be: a, A, b, B, ab, aB, Ab, AB
         self.full_pattern = re.compile(
-            rf'({prefix_pattern})\s*[-_]?\s*(\d{{3,8}})\s*[-_]?\s*([a-zA-Z]{{1,2}}|\d{{1,2}})?(?:\s*\((\d+)\))?',
+            rf'({prefix_pattern})\s*[-_]?\s*(\d{{3,8}})\s*[-_]?\s*([aAbB]{{1,2}})?',
             re.IGNORECASE
         )
         
         # Looser pattern: any 2-4 letters followed by 3-8 digits (not 6+ which is camera)
         # Only matches letter-only prefixes (not compound like MCCM-LH)
         self.loose_pattern = re.compile(
-            r'([A-Z]{2,4})\s*[-_]?\s*(\d{3,8})\s*[-_]?\s*([a-zA-Z]{1,2}|\d{1,2})?(?:\s*\((\d+)\))?',
+            r'([A-Z]{2,4})\s*[-_]?\s*(\d{3,8})\s*[-_]?\s*([aAbB]{1,2})?',
             re.IGNORECASE
         )
         
         # Pattern for just numeric ID with plate (when prefix might be in path)
         # E.g., "22270A.JPG", "26652B.JPG" - standalone specimen numbers
         self.numeric_only_pattern = re.compile(
-            r'(?<![0-9])(\d{3,8})\s*[-_]?\s*([a-zA-Z]{1,2})?\s*(?:\((\d+)\))?(?![0-9])',
+            r'(?<![0-9])(\d{3,8})\s*[-_]?\s*([aAbB]{1,2})?(?![0-9])',
             re.IGNORECASE
         )
     
@@ -222,7 +222,6 @@ class SpecimenIdExtractor:
             prefix = m.group(1).upper()
             numeric = m.group(2)
             plate = m.group(3) if m.group(3) else None
-            paren_seq = m.group(4) if len(m.groups()) >= 4 and m.group(4) else None
             
             # Filter out camera prefixes - ALWAYS check, not just for loose pattern
             if prefix in self.CAMERA_PREFIXES:
@@ -244,14 +243,10 @@ class SpecimenIdExtractor:
             # Normalize the specimen ID format: PREFIX-numeric
             specimen_id = f"{prefix}-{numeric}"
             
-            # Normalize plate: convert to lowercase single letter if possible
+            # Normalize plate: convert to lowercase
             if plate:
                 plate_normalized = plate.lower()
                 specimen_id += f"-{plate_normalized}"
-            
-            # Add parenthetical sequence if present
-            if paren_seq:
-                specimen_id += f"-{paren_seq}"
             
             return SpecimenIdMatch(
                 specimen_id=specimen_id,
@@ -280,7 +275,6 @@ class SpecimenIdExtractor:
         if m:
             numeric = m.group(1)
             plate = m.group(2).lower() if m.group(2) else None
-            paren_seq = m.group(3) if len(m.groups()) >= 3 and m.group(3) else None
             
             # Apply same camera detection as _try_extract
             # PB and P1 with 6+ digits are camera codes
@@ -290,8 +284,6 @@ class SpecimenIdExtractor:
             specimen_id = f"{prefix}-{numeric}"
             if plate:
                 specimen_id += f"-{plate}"
-            if paren_seq:
-                specimen_id += f"-{paren_seq}"
             
             return SpecimenIdMatch(
                 specimen_id=specimen_id,

@@ -215,7 +215,7 @@ class Config:
     video_extensions: set = field(default_factory=lambda: VIDEO_EXTENSIONS.copy())
     
     # === LLM Configuration ===
-    # Provider: "gemini" or "github"
+    # Provider: "gemini", "github", or "local"
     llm_provider: str = field(default_factory=lambda: os.environ.get('LLM_PROVIDER', 'github'))
     llm_requests_per_minute: int = 60  # GitHub Models allows higher RPM TODO sacar a un parámetro en condiciones
     
@@ -228,15 +228,25 @@ class Config:
     github_token_env_var: str = "GITHUB_TOKEN"
     github_models_endpoint: str = "https://models.inference.ai.azure.com"
     
+    # Local LLM settings (LM Studio or any OpenAI-compatible local server)
+    local_llm_base_url: str = field(default_factory=lambda: os.environ.get('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1'))
+    local_llm_model: str = field(default_factory=lambda: os.environ.get('LOCAL_LLM_MODEL', 'local-model'))
+    local_llm_api_key: str = field(default_factory=lambda: os.environ.get('LOCAL_LLM_API_KEY', 'lm-studio'))
+    local_llm_timeout: float = 120.0  # Local models can be slower
+    
     # Legacy aliases (for backward compatibility)
     @property
     def llm_model(self) -> str:
+        if self.llm_provider == 'local':
+            return self.local_llm_model
         if self.llm_provider == 'github':
             return self.github_model
         return self.gemini_model
     
     @property
     def llm_api_key_env_var(self) -> str:
+        if self.llm_provider == 'local':
+            return 'LOCAL_LLM_API_KEY'
         if self.llm_provider == 'github':
             return self.github_token_env_var
         return self.gemini_api_key_env_var

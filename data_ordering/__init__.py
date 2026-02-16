@@ -39,7 +39,8 @@ from .file_scanner import (
     scan_directory
 )
 from .llm_integration import (
-    GeminiClient, GitHubModelsClient, DirectoryAnalyzer, DirectoryAnalysis, RateLimiter,
+    GeminiClient, GitHubModelsClient, LocalLLMClient,
+    DirectoryAnalyzer, DirectoryAnalysis, RateLimiter,
     MockGeminiClient, analyze_directory, get_llm_client,
     GENAI_AVAILABLE, OPENAI_AVAILABLE
 )
@@ -66,7 +67,8 @@ __all__ = [
     'ImageHasher', 'HashRegistry', 'ImageHash', 'DuplicateType', 'DuplicateGroup',
     'hash_image', 'find_duplicates_in_folder',
     'FileScanner', 'ScannedFile', 'ScanProgress', 'ScanStatus', 'scan_directory',
-    'GeminiClient', 'GitHubModelsClient', 'DirectoryAnalyzer', 'DirectoryAnalysis', 
+    'GeminiClient', 'GitHubModelsClient', 'LocalLLMClient',
+    'DirectoryAnalyzer', 'DirectoryAnalysis', 
     'RateLimiter', 'MockGeminiClient', 'analyze_directory', 'get_llm_client',
     'GENAI_AVAILABLE', 'OPENAI_AVAILABLE',
     'InteractionManager', 'InteractionMode', 'DecisionType', 'DecisionOutcome',

@@ -24,14 +24,14 @@ def test_specimen_id_real_examples():
         ("LH-6120.jpg", "LH", "6120", None),
         ("LH-7335_a_.jpg", "LH", "7335", "a"),
         ("LH-7335_b_.jpg", "LH", "7335", "b"),
-        ("LH 30202 AB.JPG", "LH", "30202", None),  # AB is 2-letter plate
+        ("LH 30202 AB.JPG", "LH", "30202", "ab"),  # AB is valid plate
         ("LH-16059b.JPG", "LH", "16059", "b"),
         ("LH 16059 b.JPG", "LH", "16059", "b"),
         ("LH-07239a.JPG", "LH", "07239", "a"),
         ("LH 2442 (1).JPG", "LH", "2442", None),  # (1) is sequence, not plate
         ("LH-09645b Hispanamia newbreyi .JPG", "LH", "09645", "b"),
         ("LH_9300_20130704 (1).JPG", "LH", "9300", None),
-        ("LH32560AB.JPG", "LH", "32560", None),  # No separator
+        ("LH32560AB.JPG", "LH", "32560", "ab"),  # No separator, AB plate
         ("LH-09300.JPG", "LH", "09300", None),
         ("LH-11388 Gracilibatrachus.jpg", "LH", "11388", None),
         ("LH-928061.JPG", "LH", "928061", None),  # 6 digits
@@ -55,7 +55,7 @@ def test_specimen_id_real_examples():
         ("K-Bue 085 (1).JPG", "K-Bue", "085", None),
         ("Cer-Bue 125.JPG", "Cer-Bue", "125", None),
         ("K-Bue 170 (1).JPG", "K-Bue", "170", None),
-        ("Cer-Bue 292 AB.JPG", "Cer-Bue", "292", None),
+        ("Cer-Bue 292 AB.JPG", "Cer-Bue", "292", "ab"),
         
         # Numeric-only with context (these need path context)
         ("22270A.JPG", None, "22270", "a"),  # No prefix in filename
