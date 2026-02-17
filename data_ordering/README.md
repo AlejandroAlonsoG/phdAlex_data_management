@@ -117,7 +117,7 @@ The tool recognizes these specimen ID formats:
 | Collection | Prefixes | Examples |
 |------------|----------|----------|
 | Las Hoyas | LH, MUPA, YCLH, MCCM, MCCM-LH, ADL, MDCLM | `LH-12345678-a`, `MUPA 8765` |
-| Buenache | K-BUE, CER-BUE, PB (3-5 digits) | `K-Bue 085`, `PB 7005b` |
+| Buenache | K-BUE, CER-BUE | `K-Bue 085` |
 
 Camera codes (DSC, IMG, P1, PA, PC, etc.) are automatically filtered out.
 

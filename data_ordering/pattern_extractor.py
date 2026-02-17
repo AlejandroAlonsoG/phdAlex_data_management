@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Set
 from dataclasses import dataclass, field
 from enum import Enum
+from .config import ALL_SPECIMEN_PREFIXES
 
 
 class PatternSource(Enum):
@@ -107,7 +108,7 @@ class SpecimenIdExtractor:
     """
     Extracts specimen IDs in the format: prefix-numeric-plate
     Where:
-        prefix = 2-8 character prefix (LH, MUPA, YCLH, MCCM, MCCM-LH, K-Bue, Cer-Bue, PB)
+        prefix = 2-8 character prefix (LH, MUPA, YCLH, MCCM, MCCM-LH, K-Bue, Cer-Bue)
         numeric = 3-8 digit numeric ID (variable length)
         plate = optional plate indicator, only valid values: a, A, b, B, ab, aB, Ab, AB
     
@@ -116,7 +117,6 @@ class SpecimenIdExtractor:
         - LH 30202 AB.JPG (spaces as separators, double letter plates)
         - LH32560AB.JPG (no separator between prefix and number)
         - MCCM-LH 26452A.JPG (compound prefixes)
-        - PB 7005b.JPG (PB prefix - not a camera code!)
         - K-Bue 085.JPG (hyphenated prefixes)
         - Cer-Bue 001a.JPG (longer hyphenated prefixes)
     """
@@ -126,29 +126,31 @@ class SpecimenIdExtractor:
         Initialize with known prefixes.
         
         Args:
-            known_prefixes: List of known prefixes (e.g., ['LH', 'MUPA', 'YCLH', 'MCCM'])
+            known_prefixes: List of known prefixes (e.g., ['LH', 'MCLM', 'ADR'])
         """
-        # Standard prefixes (may contain hyphens like MCCM-LH, K-Bue, Cer-Bue)
+        # Standard prefixes (may contain hyphens like MCLM-LH)
         # Collections: LH (Las Hoyas), Buenache (K-Bue, Cer-Bue)
         default_prefixes = [
-            'LH', 'MUPA', 'YCLH', 'MCCM', 'MCCM-LH',  # Las Hoyas collection
-            'ADL', 'MDCLM',                            # Las Hoyas (to be confirmed)
-            'K-Bue', 'Cer-Bue', 'PB',                  # Buenache collection
+            'LH', 'MCLM', 'MCLM-LH', 'ADR',  # Las Hoyas collection (updated)
+            'K-Bue', 'Cer-Bue',        # Buenache collection
         ]
-        self.known_prefixes = set(p.upper() for p in (known_prefixes or default_prefixes))
+        # If caller didn't provide prefixes, use canonical list from config
+        prefixes = known_prefixes if known_prefixes is not None else list(ALL_SPECIMEN_PREFIXES) or default_prefixes
+        self.known_prefixes = set(p.upper() for p in prefixes)
         
         self._build_patterns()
     
     # Common camera/device prefixes to exclude from loose matching
-    # Note: PB is NOT a camera prefix when followed by 3-5 digits (it's a specimen prefix)
-    #       PB IS a camera prefix when followed by 6+ digits (e.g., PB182509.JPG)
     CAMERA_PREFIXES = {'IMG', 'DSC', 'DSCF', 'DSCN', 'DCIM', 'DJI', 'MG', 'PA', 'PC'}
-    CAMERA_LONG_PATTERN = re.compile(r'^(PB|P1)\d{6,}$', re.IGNORECASE)  # PB/P1 + 6+ digits = camera
+    CAMERA_LONG_PATTERN = re.compile(r'^P1\d{6,}$', re.IGNORECASE)
     
     def _build_patterns(self):
         """Build regex patterns for specimen ID extraction."""
+        # Filter out camera prefixes (P1) from pattern matching
+        specimen_prefixes = {p for p in self.known_prefixes if p not in ('P1',)}
+        
         # Sort prefixes by length (longest first) to avoid partial matches
-        sorted_prefixes = sorted(self.known_prefixes, key=len, reverse=True)
+        sorted_prefixes = sorted(specimen_prefixes, key=len, reverse=True)
         
         # Escape hyphens in prefixes for regex
         escaped_prefixes = [re.escape(p) for p in sorted_prefixes]
@@ -226,11 +228,12 @@ class SpecimenIdExtractor:
             # Filter out camera prefixes - ALWAYS check, not just for loose pattern
             if prefix in self.CAMERA_PREFIXES:
                 return None
-            
-            # PB and P1 with 6+ digits are ALWAYS camera codes, regardless of separator
-            # Real specimen codes are PB with 3-5 digits (e.g., PB 7005b, PB 2580)
-            # Camera codes are PB with 6+ digits (e.g., PB182509)
-            if prefix in ('PB', 'P1') and len(numeric) >= 6:
+
+            # If using the loose pattern, require the prefix to be one of the
+            # known specimen prefixes from configuration. This prevents two-
+            # letter accidental matches like "PB 22184b" when "PB" is not
+            # a configured prefix.
+            if not use_strict and prefix not in self.known_prefixes:
                 return None
             
             # Calculate confidence
@@ -260,12 +263,14 @@ class SpecimenIdExtractor:
         return None
     
     def _find_prefix_in_path(self, path: Path) -> Optional[str]:
-        """Find known prefix in path components."""
+        """Find known prefix in path components. Excludes camera prefixes."""
         for part in path.parts:
             part_upper = part.upper()
             for prefix in self.known_prefixes:
                 if prefix in part_upper:
-                    return prefix
+                    # Never return P1 - it's always a camera prefix
+                    if prefix.upper() not in ('P1',):
+                        return prefix
         return None
     
     def _try_numeric_only(self, text: str, prefix: str, 
@@ -276,10 +281,7 @@ class SpecimenIdExtractor:
             numeric = m.group(1)
             plate = m.group(2).lower() if m.group(2) else None
             
-            # Apply same camera detection as _try_extract
-            # PB and P1 with 6+ digits are camera codes
-            if prefix in ('PB', 'P1') and len(numeric) >= 6:
-                return None
+
             
             specimen_id = f"{prefix}-{numeric}"
             if plate:
@@ -317,7 +319,6 @@ class NumericIdExtractor:
         r'DSCF[-_]?\d+',      # Fuji
         r'DCIM[-_]?\d+',
         r'P[A1]\d{6,}',       # PA210066, P1103168 (Olympus, Panasonic with 6+ digits)
-        r'PB\d{6,}',          # PB182509 (camera, not specimen - 6+ digits)
         r'PC\d{6,}',          # PC200057 (camera with 6+ digits)
         r'_MG[-_]?\d+',       # Canon
         r'DJI[-_]?\d+',       # DJI drones

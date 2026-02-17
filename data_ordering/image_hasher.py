@@ -171,7 +171,11 @@ class ImageHasher:
         
         try:
             with Image.open(file_path) as img:
-                # Convert to RGB if necessary (handles RGBA, P mode, etc.)
+                # PSD files: Pillow only reads the flattened composite.
+                # Force-load so any decompression error surfaces here.
+                img.load()
+                
+                # Convert to RGB if necessary (handles RGBA, P, LA, CMYK, etc.)
                 if img.mode not in ('RGB', 'L'):
                     img = img.convert('RGB')
                 
@@ -180,7 +184,10 @@ class ImageHasher:
                 return str(phash)
                 
         except Exception as e:
-            logger.warning(f"Error computing pHash for {file_path}: {e}")
+            logger.warning(
+                f"Error computing pHash for {file_path.name} "
+                f"(ext={file_path.suffix}): {e}"
+            )
             return None
     
     def hash_image(self, file_path: Path, compute_perceptual: bool = True) -> ImageHash:
@@ -403,21 +410,35 @@ class HashRegistry:
                 ))
         
         # Perceptual duplicates (by pHash)
+        # Build the set of exact-duplicate groups (as frozensets) so we can
+        # detect when a perceptual group is entirely redundant.
+        exact_groups_as_sets: List[frozenset] = [
+            frozenset(paths)
+            for paths in self._md5_index.values()
+            if len(paths) > 1
+        ]
+        
         for phash, paths in self._phash_index.items():
             if len(paths) > 1:
-                # Exclude if already in exact duplicates
-                non_exact = []
-                for p in paths:
-                    h = self._hashes.get(p)
-                    if h and len(self._md5_index.get(h.md5_hash, set())) <= 1:
-                        non_exact.append(p)
+                # Check whether this perceptual group is entirely contained
+                # within a single exact-duplicate group.  If so, every pair
+                # is already accounted for → skip to avoid double-reporting.
+                entirely_redundant = any(
+                    paths.issubset(eg) for eg in exact_groups_as_sets
+                )
+                if entirely_redundant:
+                    logger.debug(
+                        f"Skipping perceptual group phash={phash}: "
+                        f"all {len(paths)} files are already in the same "
+                        f"exact-duplicate group"
+                    )
+                    continue
                 
-                if len(non_exact) > 1:
-                    result[DuplicateType.PERCEPTUAL].append(DuplicateGroup(
-                        duplicate_type=DuplicateType.PERCEPTUAL,
-                        hash_value=phash,
-                        files=non_exact
-                    ))
+                result[DuplicateType.PERCEPTUAL].append(DuplicateGroup(
+                    duplicate_type=DuplicateType.PERCEPTUAL,
+                    hash_value=phash,
+                    files=list(paths)
+                ))
         
         return result
     

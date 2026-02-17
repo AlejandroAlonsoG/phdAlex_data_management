@@ -14,7 +14,7 @@ def test_specimen_id_extractor():
     from data_ordering.pattern_extractor import SpecimenIdExtractor
     
     print("\nTesting SpecimenIdExtractor...")
-    extractor = SpecimenIdExtractor(['LH', 'MUPA', 'YCLH', 'MCCM'])
+    extractor = SpecimenIdExtractor(['LH', 'MCLM', 'MCLM-LH', 'ADR', 'K-BUE', 'CER-BUE'])
     
     # Test cases: (path_string, expected_prefix, expected_numeric, expected_plate)
     test_cases = [

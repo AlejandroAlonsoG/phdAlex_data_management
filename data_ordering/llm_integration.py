@@ -40,7 +40,7 @@ except ImportError:
 
 try:
     import google.generativeai as genai
-    from google.generativeai.types import GenerationConfig
+    from google.generativeai.types import GenerationConfig, ThinkingConfig
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
@@ -313,9 +313,11 @@ DO NOT analyze filenames - focus purely on the directory path.
 We use a 3-level hierarchy. These three levels MUST BE DIFFERENT from each other:
 
 1. MACROCLASS (fixed categories - pick exactly one):
-   - Botany: All plant life and algae
-   - Arthropoda: Animals with exoskeleton and articulated legs (insects, crustaceans, arachnids, etc.)
-   - Mollusca_y_Vermes: Soft-bodied animals (mollusks, worms)
+   - Botany: All plant life and algae (Angiosperma, Bryophyta, Pteridophyta, Pinales, etc.)
+   - Insects: Insects and arthropods (Insecta, Coleoptera)
+   - Arthropoda: Arthropods WITHOUT insects (Arachnida, Crustacea, Diplopoda, Malacostraca, Ostracoda, Branchiopoda, Heteropoda)
+   - Mollusca: Mollusks (Bivalvia, Gastropoda, Mollusca)
+   - Vermes: Worms (Clitellata, Nematoda)
    - Pisces: Fish (vertebrates with fins and gills)
    - Tetrapoda: Land vertebrates with limbs (amphibians, reptiles, birds, mammals)
    - Ichnofossils: Trace fossils (footprints, burrows, coprolites - not body fossils)
@@ -334,10 +336,10 @@ IMPORTANT RULES:
 - If you can only determine the macroclass, leave class and determination as null
 - If you can determine macroclass and class but nothing more specific, leave determination as null
 
-=== COLLECTION SITES ===
-- Las Hoyas (LH): "LH", "Las Hoyas", "MUPA", "YCLH", "Colección LH"
-- Buenache (BUE): "Buenache", "Bue", "K-Bue"
-- Montsec (MON): "Montsec", "Catalonia", "Lleida"
+=== COLLECTION SITES & SPECIMEN PREFIXES ===
+Las Hoyas (LH): Prefixes are LH, MCLM, MCLM-LH, or ADR
+Buenache (BUE): Prefixes are K-BUE, CER-BUE
+Montsec (MON): More prefixes to be confirmed
 
 === CAMPAIGN YEARS ===
 Look for 4-digit years (2018, 2019, 2020, etc.) in path.
@@ -348,24 +350,31 @@ The output schema is enforced automatically. Fill each field based on the rules 
 FILENAME_REGEX_PROMPT = """You are an expert at creating regex patterns for parsing fossil specimen filenames.
 
 Given sample filenames, create regex patterns with NAMED GROUPS to extract:
-1. specimen_id: The unique specimen identifier (e.g., "LH 12345", "MUPA-12345678")
+1. specimen_id: The unique specimen identifier in format: PREFIX-NUMERIC[-PLATE]
+   Examples: "LH-12345", "MCLM-87654321", "ADR-999-a", "K-BUE-123-b"
 2. campaign_year: Year of collection if present (e.g., 2019)
-3. plate: Plate indicator if present (a, b, etc.)
+3. plate: Plate indicator if present (a, A, b, B, aB, Ab, AB)
+
+SPECIMEN ID STRUCTURE:
+- Prefix: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE (Buenache)
+- Numeric: 1-10 digits (e.g., 5, 12345, 87654321)
+- Plate: Optional - only a, A, b, B, aB, Ab, AB (lowercase preferred)
+- Separators: space, hyphen, underscore, forward slash, or none
 
 COMMON FILENAME PATTERNS:
-- "LH 12345.jpg" → specimen_id = "LH 12345"
-- "LH-12345 a.tif" → specimen_id = "LH-12345", plate = "a"
-- "MUPA 12345678.jpg" → specimen_id = "MUPA 12345678"
-- "K-Bue 123.tif" → specimen_id = "K-Bue 123"
-- "specimen_2019_001.jpg" → campaign_year = 2019, specimen_id = "001"
+- "LH-12345.jpg" → specimen_id = "LH-12345"
+- "LH 12345a.tif" → specimen_id = "LH-12345-a"
+- "MCLM-87654321-b.jpg" → specimen_id = "MCLM-87654321-b"
+- "K-BUE_999_AB.tif" → specimen_id = "K-BUE-999-ab"
+- "specimen_2019_LH_12345.jpg" → campaign_year = 2019, specimen_id = "LH-12345"
 - "DSC00001.jpg" → likely camera-generated, not a specimen ID
 
 REGEX GUIDELINES:
 - Use Python regex syntax
 - Use named groups: (?P<name>pattern)
-- Make patterns flexible for spaces/hyphens: [-\\s]?
-- Handle optional plate indicators: (?P<plate>[ab])?
-- Example: r"(?P<specimen_id>LH[-\\s]?\\d{3,8})(?:\\s*(?P<plate>[ab]))?"
+- Make patterns flexible for spaces/hyphens/underscores: [-\\s_]?
+- Handle optional plate indicators: (?P<plate>[aAbB]{1,2})?
+- Example: r"(?P<specimen_id>(LH|MCLM|ADR)[-\\s_]?\\d{1,10})(?:\\s*(?P<plate>[aAbB]{1,2}))?"
 
 The output schema is enforced automatically. Fill each field based on the guidelines above."""
 
@@ -375,10 +384,14 @@ FILE_ANALYSIS_PROMPT = """You are an expert paleontologist. Extract information 
 This is a FALLBACK analysis when regex patterns failed. Be as accurate as possible.
 
 SPECIMEN ID FORMATS:
-- "LH 12345" or "LH-12345" (Las Hoyas)
-- "MUPA 12345678" (Museum number)
-- "K-Bue 123" (Buenache)
-- Numeric sequences that look like specimen IDs (not camera numbers like DSC00001)
+Specimen IDs follow the structure: PREFIX-NUMERIC[-PLATE]
+- Prefix options: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE, (Buenache)
+- Numeric: 1-10 digits (e.g., 5, 12345, 87654321)
+- Plate: Optional single letter or pair (a, A, b, B, aB, Ab, AB)
+- Examples: "LH-12345", "MCLM-87654321-a", "K-BUE-999-b"
+
+Examples of camera numbers (NOT specimen IDs):
+- DSC00001, IMG_1234, DSCN5678, _MG_7890, DJI_0042
 
 The output schema is enforced automatically. Fill each field based on the formats above."""
 
@@ -398,8 +411,8 @@ PATH_ANALYSIS_SCHEMA = {
         "macroclass": {
             "type": "string",
             "nullable": True,
-            "enum": ["Botany", "Arthropoda", "Mollusca_y_Vermes", "Pisces", "Tetrapoda", "Ichnofossils"],
-            "description": "Top-level category. Botany=plants/algae, Arthropoda=insects/crustaceans/arachnids, Mollusca_y_Vermes=mollusks/worms, Pisces=fish, Tetrapoda=amphibians/reptiles/birds/mammals, Ichnofossils=trace fossils. Null if undetermined."
+            "enum": ["Botany", "Insects", "Arthropoda", "Mollusca", "Vermes", "Pisces", "Tetrapoda", "Ichnofossils"],
+            "description": "Top-level category. Botany=plants/algae, Insects=insects/Coleoptera, Arthropoda=arthropods without insects, Mollusca=mollusks, Vermes=worms, Pisces=fish, Tetrapoda=amphibians/reptiles/birds/mammals, Ichnofossils=trace fossils. Null if undetermined."
         },
         "taxonomic_class": {
             "type": "string",
@@ -419,7 +432,7 @@ PATH_ANALYSIS_SCHEMA = {
         "specimen_id": {
             "type": "string",
             "nullable": True,
-            "description": "Specimen identifier if directly visible in the directory path (e.g. LH-12345). Null if not present in path."
+            "description": "Specimen identifier if directly visible in the directory path in format PREFIX-NUMERIC[-PLATE] (e.g. LH-12345, MCLM-87654321-a). Null if not present in path."
         },
         "collection_code": {
             "type": "string",
@@ -476,7 +489,7 @@ FILE_ANALYSIS_SCHEMA = {
         "specimen_id": {
             "type": "string",
             "nullable": True,
-            "description": "Extracted specimen ID. Formats: 'LH 12345', 'LH-12345' (Las Hoyas), 'MUPA 12345678' (museum), 'K-Bue 123' (Buenache). Null if not identifiable."
+            "description": "Extracted specimen ID in format PREFIX-NUMERIC[-PLATE]. Examples: 'LH-12345', 'MCLM-87654321-a', 'K-BUE-999-b', 'ADR-5'. Valid prefixes: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE (Buenache). Null if not identifiable."
         },
         "campaign_year": {
             "type": "integer",
@@ -1052,14 +1065,22 @@ class GitHubModelsClient(BaseLLMClient):
 
 class GeminiClient(BaseLLMClient):
     """
-    Client for Google Gemini API with structured output.
+    Client for Google Gemini API with structured output and thinking support.
     """
+    
+    # Thinking levels mapped to task complexity
+    THINKING_LEVELS = {
+        'path_analysis': 'low',           # Quick thinking - fast path analysis
+        'filename_regex': 'low',          # Quick thinking - fast regex generation
+        'file_analysis': 'low',           # Quick thinking - simple filename parsing
+    }
     
     def __init__(
         self,
         api_key: str = None,
         model: str = None,
-        requests_per_minute: int = None
+        requests_per_minute: int = None,
+        enable_thinking: bool = True
     ):
         super().__init__(requests_per_minute or config.llm_requests_per_minute)
         
@@ -1073,18 +1094,22 @@ class GeminiClient(BaseLLMClient):
             raise ValueError(f"API key required. Set {config.llm_api_key_env_var} env var")
         
         self.model_name = model or config.llm_model
+        self.enable_thinking = enable_thinking
         
         genai.configure(api_key=self.api_key)
         self.model = genai.GenerativeModel(self.model_name)
         
-        logger.info(f"Initialized Gemini client with model {self.model_name}")
+        logger.info(
+            f"Initialized Gemini client with model {self.model_name} "
+            f"(thinking: {'enabled' if enable_thinking else 'disabled'})"
+        )
     
     def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
-        """Make API call with structured output enforcement.
+        """Make API call with structured output and thinking support.
         
         Uses Gemini's response_schema parameter when a schema_name is provided,
-        guaranteeing the response matches the schema. Falls back to basic
-        application/json mode if no schema is given.
+        guaranteeing the response matches the schema. Applies appropriate thinking
+        level based on task complexity (schema_name).
         """
         logger.debug(f"[LLM_REQUEST] schema={schema_name} | prompt={user_prompt[:300]}")
         
@@ -1092,9 +1117,17 @@ class GeminiClient(BaseLLMClient):
         
         gen_config_kwargs = {
             "temperature": 0.1,
-            "max_output_tokens": 1024,
+            "max_output_tokens": 2048,
             "response_mime_type": "application/json",
         }
+        
+        # Add thinking configuration if enabled
+        if self.enable_thinking and schema_name in self.THINKING_LEVELS:
+            thinking_level = self.THINKING_LEVELS[schema_name]
+            gen_config_kwargs["thinking_config"] = ThinkingConfig(
+                thinking_level=thinking_level
+            )
+            logger.debug(f"[THINKING] schema={schema_name} | level={thinking_level}")
         
         if schema_name and schema_name in _SCHEMAS:
             gen_config_kwargs["response_schema"] = _SCHEMAS[schema_name]

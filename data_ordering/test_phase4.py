@@ -38,7 +38,7 @@ def create_test_directory():
     # 2. Buenache specimens
     bue_files = [
         ("Buenache/Crustacea/K-Bue 085.jpg", b"fake image 5"),
-        ("Buenache/PB 7005b.jpg", b"fake image 6"),
+
     ]
     
     # 3. Camera files (no specimen ID)
@@ -133,8 +133,8 @@ def test_pattern_extraction():
         for f in without_specimen:
             print(f"  {f.path.name}")
         
-        # Should find: LH-15083, LH-6120, MCCM-LH-26452, K-BUE-085, PB-7005
-        assert len(with_specimen) >= 5, f"Expected at least 5 specimen IDs, got {len(with_specimen)}"
+        # Should find: LH-15083, LH-6120, MCCM-LH-26452, K-BUE-085
+        assert len(with_specimen) >= 4, f"Expected at least 4 specimen IDs, got {len(with_specimen)}"
         
         print("\n[PASS] Pattern extraction test passed")
         return True
@@ -170,7 +170,7 @@ def test_collection_detection():
             print(f"  {f.path.name}")
         
         # LH should have files with LH prefix + MCCM-LH + files in "Las Hoyas" folder
-        # BUE should have K-Bue and PB files
+        # BUE should have K-Bue files
         assert len(lh_files) >= 4, f"Expected at least 4 LH files, got {len(lh_files)}"
         assert len(bue_files) >= 2, f"Expected at least 2 BUE files, got {len(bue_files)}"
         

@@ -31,21 +31,37 @@ MACROCLASSES = {
             'Planta', 'Pteridophyta', 'Pterophyta'
         }),
     },
-    'Arthropoda': {
-        'name': 'Arthropoda',
-        'name_es': 'Artrópodos',
-        'folder': 'Arthropoda',
+    'Insects': {
+        'name': 'Insects',
+        'name_es': 'Insectos',
+        'folder': 'Insects',
         'classes': frozenset({
-            'Arachnida', 'Branchiopoda', 'Coleoptera', 'Crustacea', 'Diplopoda', 'Heteropoda',
-            'Insecta', 'Malacostraca', 'Ostracoda'
+            'Coleoptera', 'Insecta'
         }),
     },
-    'Mollusca_Vermes': {
-        'name': 'Mollusca & Vermes',
-        'name_es': 'Moluscos y gusanos',
-        'folder': 'Mollusca_Vermes',
+    'Arthropoda': {
+        'name': 'Arthropoda (Non-Insecta)',
+        'name_es': 'Artrópodos (sin Insectos)',
+        'folder': 'Arthropoda',
         'classes': frozenset({
-            'Bivalvia', 'Clitellata', 'Gastropoda', 'Mollusca', 'Nematoda'
+            'Arachnida', 'Branchiopoda', 'Crustacea', 'Diplopoda', 'Heteropoda',
+            'Malacostraca', 'Ostracoda'
+        }),
+    },
+    'Mollusca': {
+        'name': 'Mollusca',
+        'name_es': 'Moluscos',
+        'folder': 'Mollusca',
+        'classes': frozenset({
+            'Bivalvia', 'Gastropoda', 'Mollusca'
+        }),
+    },
+    'Vermes': {
+        'name': 'Vermes',
+        'name_es': 'Gusanos',
+        'folder': 'Vermes',
+        'classes': frozenset({
+            'Clitellata', 'Nematoda'
         }),
     },
     'Pisces': {
@@ -61,8 +77,8 @@ MACROCLASSES = {
         'name_es': 'Tetrápodos',
         'folder': 'Tetrapoda',
         'classes': frozenset({
-            'Amphibia', 'Aves', 'Mammalia', 'Sauropsida', ' Sauropsida',
-            'Reptilia', 'Tetrapoda', 'Testudines', 'Vertebrata'
+            'Amphibia', 'Aves', 'Mammalia', 'Reptilia', 'Sauropsida',
+            'Tetrapoda', 'Testudines', 'Vertebrata'
         }),
     },
     'Ichnofossils': {
@@ -70,7 +86,7 @@ MACROCLASSES = {
         'name_es': 'Icnofósiles',
         'folder': 'Ichnofossils',
         'classes': frozenset({
-            'icnofósil', 'icnofósiles', 'Icnofósil', 'Icnofósiles', 'Coprolitos'
+            'Coprolitos', 'icnofósil', 'icnofósiles'
         }),
     },
 }
@@ -129,8 +145,7 @@ IMAGE_EXTENSIONS = IMAGE_WITH_METADATA_SUPPORT | IMAGE_WITHOUT_METADATA_SUPPORT
 JPEG_QUALITY = 95  # Quality for JPEG conversion (1-100)
 
 # Image extensions that PIL/Pillow can reliably open and convert to JPEG.
-# Formats outside this set will keep their original format and use
-# file-bytes MD5 instead of normalised-JPEG MD5.
+# For formats NOT in this set, ImageMagick will be used as a fallback.
 PIL_CONVERTIBLE_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif',
     '.webp', '.psd',  # Pillow reads flattened PSD
@@ -166,13 +181,13 @@ COLLECTIONS = {
     'las_hoyas': CollectionConfig(
         name="Las Hoyas",
         code="LH",
-        prefixes=('LH', 'MUPA', 'YCLH', 'MCCM', 'MCCM-LH', 'ADL', 'MDCLM'),
+        prefixes=('LH', 'MCLM', 'MCLM-LH', 'ADR'),
         path_keywords=('las hoyas', 'lashoyas', 'hoyas', 'colección lh'),
     ),
     'buenache': CollectionConfig(
         name="Buenache",
         code="BUE",
-        prefixes=('K-BUE', 'CER-BUE', 'PB'),  # Note: PB may need disambiguation
+        prefixes=('K-BUE', 'CER-BUE'),
         path_keywords=('buenache', 'bue', 'cantera'),
     ),
     'montsec': CollectionConfig(

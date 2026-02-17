@@ -1622,6 +1622,28 @@ class PipelineOrchestrator:
         self.action_logger.stage_start("DEDUPLICATION")
         self.state.stage = PipelineStage.DEDUPLICATION
         
+        # Log registry stats for diagnostics
+        logger.info(
+            f"Hash registry: {self.hash_registry.total_files} files | "
+            f"MD5 groups with >1 file: "
+            f"{sum(1 for v in self.hash_registry._md5_index.values() if len(v) > 1)} | "
+            f"pHash groups with >1 file: "
+            f"{sum(1 for v in self.hash_registry._phash_index.values() if len(v) > 1)}"
+        )
+        
+        # Detect files registered without phash (could miss perceptual dupes)
+        no_phash = [
+            str(p) for p, h in self.hash_registry._hashes.items()
+            if h.phash is None
+        ]
+        if no_phash:
+            logger.warning(
+                f"{len(no_phash)} image(s) have no perceptual hash (pHash) — "
+                f"they will be invisible to perceptual duplicate detection. "
+                f"Files: {[Path(p).name for p in no_phash[:10]]}"
+                f"{'...' if len(no_phash) > 10 else ''}"
+            )
+        
         # Find duplicate groups
         duplicate_groups_dict = self.hash_registry.get_all_duplicate_groups()
         
@@ -1630,10 +1652,31 @@ class PipelineOrchestrator:
         for dup_type, groups in duplicate_groups_dict.items():
             all_groups.extend(groups)
         
+        # Safety check: validate all groups have at least 2 files
+        invalid_groups = [g for g in all_groups if len(g.files) < 2]
+        if invalid_groups:
+            logger.warning(
+                f"Found {len(invalid_groups)} invalid duplicate groups with < 2 files. "
+                f"Filtering them out."
+            )
+            all_groups = [g for g in all_groups if len(g.files) >= 2]
+        
         # Mark duplicates in processed files
         for group in all_groups:
-            # First file is the "original"
-            original_path = str(group.files[0])
+            # Pick the "original" file to keep.
+            # Prefer a file that is NOT already marked as a duplicate (from
+            # a previously processed group, e.g. an exact-duplicate group
+            # processed before a perceptual group that overlaps).
+            original_path = None
+            for candidate in group.files:
+                pf = self.state.processed_files.get(str(candidate), {})
+                if not pf.get('is_duplicate'):
+                    original_path = str(candidate)
+                    break
+            if original_path is None:
+                # All files are already marked as duplicates in other groups;
+                # just use the first one.
+                original_path = str(group.files[0])
             
             # Log the duplicate group
             self.action_logger.duplicate_group(
@@ -1759,8 +1802,10 @@ class PipelineOrchestrator:
                             f"Discrepancia_metadata_{short_hash}"
                         )
             
-            for dup_path in group.files[1:]:
+            for dup_path in group.files:
                 path_str = str(dup_path)
+                if path_str == original_path:
+                    continue  # Skip the original
                 if path_str in self.state.processed_files:
                     self.state.processed_files[path_str]['is_duplicate'] = True
                     self.state.processed_files[path_str]['duplicate_of'] = original_path
@@ -1779,6 +1824,27 @@ class PipelineOrchestrator:
         self._save_state()
         
         dup_count = sum(1 for pf in self.state.processed_files.values() if pf.get('is_duplicate'))
+        
+        # Validate: every file marked as duplicate should have a valid duplicate_of reference
+        orphaned_dups = [
+            (fpath, pf) for fpath, pf in self.state.processed_files.items()
+            if pf.get('is_duplicate') and (
+                not pf.get('duplicate_of') or 
+                pf.get('duplicate_of') not in self.state.processed_files
+            )
+        ]
+        if orphaned_dups:
+            logger.warning(
+                f"Found {len(orphaned_dups)} orphaned duplicates (marked as duplicate but "
+                f"without valid 'duplicate_of' reference). Clearing their duplicate flags."
+            )
+            for fpath, pf in orphaned_dups:
+                pf['is_duplicate'] = False
+                pf.pop('duplicate_of', None)
+                self.action_logger.warning(
+                    f"Orphaned duplicate flag cleared for {Path(fpath).name}"
+                )
+            dup_count = sum(1 for pf in self.state.processed_files.values() if pf.get('is_duplicate'))
         self.action_logger.stage_end(
             "DEDUPLICATION",
             f"Groups: {len(all_groups)} | Duplicate files: {dup_count} | Unique: {len(self.state.processed_files) - dup_count}"
@@ -1793,35 +1859,87 @@ class PipelineOrchestrator:
     def _copy_as_jpeg(source_path: Path, dest_path: Path) -> bool:
         """Try to convert *source_path* to JPEG and save at *dest_path*.
 
-        Returns True if the conversion succeeded, False if PIL could not
-        open / convert the file (caller should fall back to a raw copy).
-        """
-        from .config import PIL_CONVERTIBLE_EXTENSIONS, JPEG_QUALITY
+        Attempts conversion in this order:
+        1. Pillow (PIL) for common formats
+        2. ImageMagick via subprocess for RAW/proprietary formats (.nef, .cr2, etc.)
+        3. Raw file copy as fallback
 
-        if source_path.suffix.lower() not in PIL_CONVERTIBLE_EXTENSIONS:
+        Returns True if the conversion succeeded, False if all methods failed.
+        """
+        from .config import IMAGE_EXTENSIONS, JPEG_QUALITY
+        import subprocess
+        import shutil
+
+        ext = source_path.suffix.lower()
+        if ext not in IMAGE_EXTENSIONS:
             return False
 
+        # --- Try Pillow first (fast) ---
         try:
             from PIL import Image
-        except ImportError:
-            return False
-
-        try:
             with Image.open(source_path) as img:
                 if img.mode not in ('RGB', 'L'):
                     img = img.convert('RGB')
                 elif img.mode == 'L':
                     img = img.convert('RGB')
                 img.save(dest_path, format='JPEG', quality=JPEG_QUALITY)
-            # Preserve source file timestamps as much as possible
+            # Preserve source file timestamps
+            import os
+            stat = os.stat(source_path)
+            os.utime(dest_path, (stat.st_atime, stat.st_mtime))
+            logger.debug(f"Converted {source_path.name} to JPEG using Pillow")
+            return True
+        except Exception as pil_error:
+            logger.debug(f"Pillow could not open {source_path.name}: {pil_error}")
+            # Continue to ImageMagick fallback
+
+        # --- Try ImageMagick (for RAW/proprietary formats) ---
+        try:
+            # Check if ImageMagick is available
+            result = subprocess.run(
+                ['magick', '--version'],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                raise RuntimeError("ImageMagick not available (Windows)")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # Try 'convert' command (Linux/Mac) instead of 'magick'
+            try:
+                result = subprocess.run(
+                    ['convert', '--version'],
+                    capture_output=True,
+                    timeout=5
+                )
+                if result.returncode != 0:
+                    raise RuntimeError("ImageMagick not available")
+                cmd = 'convert'
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                logger.debug(f"ImageMagick not installed, cannot convert {source_path.name}")
+                return False
+        else:
+            cmd = 'magick'
+
+        try:
+            # Use ImageMagick to convert
+            # Format: convert input.nef -quality 95 output.jpg
+            subprocess.run(
+                [cmd, str(source_path), '-quality', str(JPEG_QUALITY), str(dest_path)],
+                capture_output=True,
+                timeout=30,
+                check=True
+            )
+            logger.debug(f"Converted {source_path.name} to JPEG using ImageMagick")
+            
+            # Preserve source timestamps
             import os
             stat = os.stat(source_path)
             os.utime(dest_path, (stat.st_atime, stat.st_mtime))
             return True
-        except Exception as e:
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Exception) as im_error:
             logger.debug(
-                f"PIL could not convert {source_path.name} to JPEG, "
-                f"falling back to raw copy: {e}"
+                f"ImageMagick conversion failed for {source_path.name}: {im_error}. "
+                f"Will keep original format."
             )
             return False
 
@@ -1905,17 +2023,34 @@ class PipelineOrchestrator:
             return dest_dir, new_filename
         
         # Handle duplicates (without review flags)
+        # Validate that this is a genuine duplicate by checking duplicate_of reference
         if pf_data.get('is_duplicate'):
-            dest_dir = self.output_dir / 'Duplicados'
-            new_filename = self._generate_new_filename(pf_data, source_path)
-            return dest_dir, new_filename
+            duplicate_of = pf_data.get('duplicate_of')
+            if duplicate_of and duplicate_of in self.state.processed_files:
+                # Confirmed duplicate with valid original reference
+                dest_dir = self.output_dir / 'Duplicados'
+                new_filename = self._generate_new_filename(pf_data, source_path)
+                return dest_dir, new_filename
+            else:
+                # Orphaned duplicate flag - likely a corrupted state
+                # Log warning and treat as regular file
+                logger.warning(
+                    f"File {source_path.name} marked as duplicate but has no valid "
+                    f"'duplicate_of' reference. Treating as regular file."
+                )
+                self.action_logger.warning(
+                    f"Orphaned duplicate flag removed for {source_path.name}"
+                )
+                pf_data['is_duplicate'] = False
+                pf_data.pop('duplicate_of', None)
         
         # Check for critical missing data - goes to Casos_Perdidos_Generales
         has_any_taxonomy = pf_data.get('macroclass') or pf_data.get('taxonomic_class') or pf_data.get('determination')
         has_specimen = pf_data.get('specimen_id')
+        has_campaign = pf_data.get('campaign_year')
         
-        if not has_any_taxonomy and not has_specimen:
-            # Total loss - no taxonomy or specimen info
+        if not has_any_taxonomy and not has_specimen and not has_campaign:
+            # Total loss - no taxonomy, specimen info, or campaign year
             dest_dir = self.output_dir / 'Casos_Perdidos_Generales'
             new_filename = self._generate_new_filename(pf_data, source_path)
             return dest_dir, new_filename

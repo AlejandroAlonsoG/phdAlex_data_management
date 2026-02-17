@@ -44,13 +44,6 @@ def test_specimen_id_real_examples():
         ("MCCM-LH 7008B.JPG", "MCCM-LH", "7008", "b"),
         ("MCCM-LH 928045A.JPG", "MCCM-LH", "928045", "a"),
         
-        # PB prefix (new discovery!)
-        ("PB 7005b.JPG", "PB", "7005", "b"),
-        ("PB 22184b.JPG", "PB", "22184", "b"),
-        ("PB 26134b.JPG", "PB", "26134", "b"),
-        ("PB 13282a.JPG", "PB", "13282", "a"),
-        ("PB 2580.JPG", "PB", "2580", None),
-        
         # K-Bue and Cer-Bue prefixes (Buenache collection)
         ("K-Bue 085 (1).JPG", "K-Bue", "085", None),
         ("Cer-Bue 125.JPG", "Cer-Bue", "125", None),
@@ -71,14 +64,13 @@ def test_specimen_id_real_examples():
         "IMG_0823.JPG",
         "IMG_2277.JPG",
         "PA210066.JPG",  # Olympus camera
-        "PB182509.JPG",  # Olympus camera (looks like PB prefix but isn't)
         "PC200057.JPG",  # Olympus camera
         "P1103168.JPG",  # Camera
         "_DSC1935.JPG",
         "DSCN1394.JPG",
     ]
     
-    extractor = SpecimenIdExtractor(known_prefixes=['LH', 'MUPA', 'YCLH', 'MCCM', 'PB', 'K-Bue', 'Cer-Bue', 'MCCM-LH'])
+    extractor = SpecimenIdExtractor(known_prefixes=['LH', 'MUPA', 'YCLH', 'MCCM', 'K-Bue', 'Cer-Bue', 'MCCM-LH'])
     
     print("=" * 60)
     print("SPECIMEN ID EXTRACTION - POSITIVE EXAMPLES")
@@ -151,9 +143,6 @@ def test_path_taxonomy():
         "Colección LH-/5. Tetrápodos/Anfibios/Anura/LH-11388 Gracilibatrachus.jpg",
         "Colección LH-/5. Tetrápodos/Aves/LH-00022 Iberomesornis/Iberomesornis (7).JPG",
         "Colección LH-/5. Tetrápodos/Reptiles/Meyasaurus/LH-445.JPG",
-        "Fotos/FILICALES/Weichselia reticulata 02/PB 2812a.JPG",
-        "Fotos/PERACARIDA/Spelaeogriphaceae indet.01/PB 15247a.JPG",
-        "Fotos/Fotos/TELEOSTEI 126/PB 28422a.JPG",
         "4fotografia_grupos/Archosauria_LH_fotos/AvesLH/Concornis/Cocnrnis1.tif",
         "4fotografia_grupos/Catálogo fotografico insectos Las Hoyas/Iberonepa romerali/LH 1253/LH 1253a/P1040699.TIF",
         "Colección Buenache/Buenache 2017/Cantera/Crustacea/K-Bue 084.JPG",
@@ -193,7 +182,7 @@ def test_date_extraction():
         ("Laboratorio_MCCM_03_05_07_/IMG_2224.jpg", 2007, 5, 3),
         ("Dino_Prep_/Img_Dino_Prep_06_01_11_/PC143066.JPG", 2011, 1, None),  # Ambiguous
         ("2010-10-18  01 Primer DíaTiffs/Imag 02.tif", 2010, 10, 18),
-        ("Fotos 2009/FILICALES/Weichselia reticulata 02/PB 6216.JPG", 2009, None, None),
+        "Fotos 2009/FILICALES/Weichselia reticulata 02/2009_6216.JPG",
     ]
     
     date_extractor = DateExtractor()
@@ -238,7 +227,7 @@ def test_numeric_id():
         ("DSC00016.jpg", True),
         ("IMG_1171.JPG", True),
         ("PA210066.JPG", True),
-        ("PB182509.JPG", True),  # Camera code, not PB prefix!
+        ("PA210066.JPG", True),  # Camera code
         ("LH-15083_a_.jpg", False),  # Specimen
         ("22270A.JPG", False),  # Specimen number
         ("3200.jpg", False),  # Catalog number
@@ -261,7 +250,7 @@ def test_full_extraction():
     """Test complete extraction pipeline with real paths."""
     
     extractor = PatternExtractor(
-        known_prefixes=['LH', 'MUPA', 'YCLH', 'MCCM', 'PB', 'K-Bue', 'Cer-Bue', 'MCCM-LH']
+        known_prefixes=['LH', 'MUPA', 'YCLH', 'MCCM', 'K-Bue', 'Cer-Bue', 'MCCM-LH']
     )
     
     paths = [
@@ -269,9 +258,7 @@ def test_full_extraction():
         "Colección LH-/5. Tetrápodos/Anfibios/Anura/LH-11388 Gracilibatrachus.jpg",
         "18Nov/IMG_1_18Nov_/LH-15083_a_.jpg",
         "Colección LH-/7. Coprolitos/MCCM-LH 26452A.JPG",
-        "Fotos/PERACARIDA/Spelaeogriphaceae indet.01/PB 15247a.JPG",
         "Colección Buenache/Buenache 2017/Cantera/Crustacea/K-Bue 084.JPG",
-        "Fotos 2009/FILICALES/Weichselia reticulata 02/PB 6216.JPG",
     ]
     
     print("\n" + "=" * 60)
