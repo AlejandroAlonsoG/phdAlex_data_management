@@ -31,6 +31,8 @@ class DecisionType(Enum):
     UNKNOWN_COLLECTION = "unknown_collection"       # Cannot determine collection
     NO_SPECIMEN_ID = "no_specimen_id"               # Could not extract specimen ID
     LLM_REGEX_FAILED = "llm_regex_failed"           # LLM-provided regex didn't work
+    MERGE_FILE_COLLISION = "merge_file_collision"   # Merge: different file at same path
+    MERGE_REGISTRY_CONFLICT = "merge_registry_conflict"  # Merge: registry field discrepancy
 
 
 class DecisionOutcome(Enum):
@@ -406,6 +408,8 @@ class InteractionManager:
             DecisionType.UNKNOWN_COLLECTION: "Unknown_Collection",
             DecisionType.NO_SPECIMEN_ID: "No_Specimen_ID",
             DecisionType.LLM_REGEX_FAILED: "LLM_Review",
+            DecisionType.MERGE_FILE_COLLISION: "Merge_File_Collisions",
+            DecisionType.MERGE_REGISTRY_CONFLICT: "Merge_Registry_Conflicts",
         }
         
         subfolder = folder_map.get(decision_type, "Other_Review")
@@ -741,4 +745,78 @@ def create_camera_number_decision(
             "Enter a custom specimen ID",
         ],
         default_option=1,  # Default: discard (safer)
+    )
+
+
+# ---------- Merge-specific decisions ----------
+
+def create_merge_file_collision_decision(
+    staging_path: Path,
+    output_path: Path,
+    staging_md5: str,
+    output_md5: str,
+    staging_size: int,
+    output_size: int,
+) -> DecisionRequest:
+    """Create a decision request for a file collision during merge.
+
+    This is used when the same relative path exists in both staging and
+    output but the files are different (different MD5).
+    """
+    rel = output_path.name
+    return DecisionRequest(
+        decision_type=DecisionType.MERGE_FILE_COLLISION,
+        file_path=staging_path,
+        message=(
+            f"File collision during merge: {rel}\n"
+            f"  Staging: {staging_size:,} bytes (MD5: {staging_md5[:12]}…)\n"
+            f"  Output:  {output_size:,} bytes (MD5: {output_md5[:12]}…)"
+        ),
+        context={
+            'staging_path': str(staging_path),
+            'output_path': str(output_path),
+            'staging_md5': staging_md5,
+            'output_md5': output_md5,
+            'staging_size': staging_size,
+            'output_size': output_size,
+        },
+        options=[
+            "Keep existing (skip staging file)",
+            "Overwrite with staging file",
+            "Keep both (rename staging file)",
+        ],
+        default_option=0,  # Keep existing is the safe default
+    )
+
+
+def create_merge_registry_conflict_decision(
+    registry_name: str,
+    match_label: str,
+    comparison_table: str,
+    context_info: Optional[Dict[str, str]] = None,
+) -> DecisionRequest:
+    """Create a decision request for a registry field conflict during merge.
+
+    Args:
+        registry_name: Name of the registry file (e.g. ``anotaciones.xlsx``).
+        match_label: Human-readable label for the matched record
+            (e.g. ``hash=abc123…`` or ``specimen_id=LH-12345``).
+        comparison_table: Pre-formatted comparison table string.
+        context_info: Extra context key-value pairs to attach.
+    """
+    return DecisionRequest(
+        decision_type=DecisionType.MERGE_REGISTRY_CONFLICT,
+        file_path=Path(registry_name),  # symbolic — the registry file
+        message=(
+            f"Registry conflict in {registry_name} ({match_label}):\n\n"
+            f"{comparison_table}"
+        ),
+        context=context_info or {},
+        options=[
+            "Keep existing (output) values",
+            "Use staging values",
+            "Enter custom value for each field",
+            "Defer (leave for later)",
+        ],
+        default_option=0,  # Keep existing is the safe default
     )

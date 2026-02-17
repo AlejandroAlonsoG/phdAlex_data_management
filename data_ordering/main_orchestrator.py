@@ -1663,10 +1663,30 @@ class PipelineOrchestrator:
                         values_seen[val_str].append(fpath_str)
                 
                 # Filter out None-only entries; a discrepancy is when there are
-                # ≥2 distinct NON-None values, OR 1 non-None vs None (meaningful diff)
+                # ≥2 distinct NON-None values (a real conflict).
+                # When only 1 non-None value exists alongside None entries,
+                # auto-fill the non-None value into files that lack it.
                 non_none_vals = {v for v in values_seen if v is not None}
-                if len(non_none_vals) >= 2 or (len(non_none_vals) == 1 and None in values_seen):
-                    # Real discrepancy found
+                if len(non_none_vals) == 1 and None in values_seen:
+                    # Only one meaningful value — propagate it to files
+                    # that have None, no user intervention needed.
+                    winning_val_str = next(iter(non_none_vals))
+                    for fpath_str in values_seen[None]:
+                        pf = self.state.processed_files.get(fpath_str)
+                        if pf:
+                            pf[field_name] = winning_val_str
+                    logger.info(
+                        f"Duplicate group (hash={group.hash_value[:16]}): "
+                        f"auto-filled '{field_name}' = '{winning_val_str}' for "
+                        f"{len(values_seen[None])} file(s) missing the value"
+                    )
+                    self.action_logger.info(
+                        f"Duplicate auto-fill: {field_name}='{winning_val_str}' "
+                        f"for {len(values_seen[None])} file(s) in group "
+                        f"hash={group.hash_value[:16]}"
+                    )
+                elif len(non_none_vals) >= 2:
+                    # Real discrepancy: ≥2 distinct non-None values
                     disc_list = []
                     for val_str, fpaths in values_seen.items():
                         display_val = val_str if val_str is not None else "(empty)"

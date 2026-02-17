@@ -19,7 +19,6 @@ Usage:
     python -m data_ordering.merge_output --staging <staging_dir> --auto
 """
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -31,6 +30,15 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 
 import pandas as pd
+
+from .image_hasher import ImageHasher, DuplicateType
+from .config import IMAGE_EXTENSIONS
+from .interaction_manager import (
+    InteractionManager, InteractionMode, DecisionType, DecisionOutcome,
+    DecisionRequest, DecisionResult,
+    create_merge_file_collision_decision,
+    create_merge_registry_conflict_decision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +100,9 @@ class OutputMerger:
         output_dir: Path = None,
         dry_run: bool = False,
         auto_accept: bool = False,
+        interaction_mode: str = None,
+        image_hasher: ImageHasher = None,
+        interaction_manager: InteractionManager = None,
     ):
         """
         Initialize the merger.
@@ -101,10 +112,26 @@ class OutputMerger:
             output_dir: The final output directory (auto-detected from staging_info.json if None)
             dry_run: If True, preview changes without modifying anything
             auto_accept: If True, auto-resolve conflicts (skip duplicates, keep existing)
+            interaction_mode: 'interactive', 'deferred', 'auto_accept' (overrides auto_accept)
+            image_hasher: ImageHasher instance (shared with orchestrator); created if None
+            interaction_manager: InteractionManager instance (shared); created if None
         """
         self.staging_dir = Path(staging_dir)
         self.dry_run = dry_run
-        self.auto_accept = auto_accept
+        
+        # --- Interaction mode ---
+        if interaction_mode:
+            mode_map = {
+                'interactive': InteractionMode.INTERACTIVE,
+                'deferred': InteractionMode.DEFERRED,
+                'auto_accept': InteractionMode.AUTO_ACCEPT,
+                'step_by_step': InteractionMode.STEP_BY_STEP,
+            }
+            self._interaction_mode = mode_map.get(interaction_mode, InteractionMode.DEFERRED)
+        elif auto_accept:
+            self._interaction_mode = InteractionMode.AUTO_ACCEPT
+        else:
+            self._interaction_mode = InteractionMode.INTERACTIVE
         
         # Load staging info
         self.staging_info = self._load_staging_info()
@@ -120,18 +147,39 @@ class OutputMerger:
                 "Provide --output or ensure staging_info.json exists in staging directory."
             )
         
+        # --- Shared components (same as orchestrator) ---
+        self.image_hasher = image_hasher or ImageHasher()
+        self.interaction_manager = interaction_manager or InteractionManager(
+            mode=self._interaction_mode,
+            review_base_dir=self.output_dir / "Manual_Review",
+            log_decisions=True,
+        )
+        
         # Stats
         self.stats = {
             'files_copied': 0,
             'files_skipped_duplicate': 0,
+            'files_skipped_near_duplicate': 0,
             'files_skipped_conflict': 0,
             'directories_created': 0,
             'registry_records_merged': 0,
             'registry_conflicts': 0,
+            'hashes_from_registry': 0,
+            'hashes_computed': 0,
             'errors': 0,
         }
         
         self.conflicts: List[MergeConflict] = []
+
+        # Hash caches loaded from hashes.xlsx (populated by _load_hash_registries)
+        # Maps normalised file-path string → {'md5_hash': str, 'phash': str}
+        self._staging_hashes: Dict[str, Dict[str, str]] = {}
+        self._output_hashes: Dict[str, Dict[str, str]] = {}
+
+        # Reverse indexes for the OUTPUT side (all-vs-all duplicate detection)
+        # Populated by _load_hash_registries → _build_output_hash_index
+        self._output_md5_index: Dict[str, List[str]] = {}   # md5 → [file_path, …]
+        self._output_phash_index: Dict[str, List[str]] = {} # phash → [file_path, …]
     
     def _load_staging_info(self) -> Optional[Dict]:
         """Load staging_info.json from the staging directory."""
@@ -141,48 +189,125 @@ class OutputMerger:
                 return json.load(f)
         return None
     
-    def _compute_md5(self, file_path: Path) -> str:
-        """Compute MD5 hash of a file."""
-        md5 = hashlib.md5()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
-                md5.update(chunk)
-        return md5.hexdigest()
-    
-    def _ask_user(self, question: str, options: List[str], default: int = 0) -> int:
+    def _load_hash_registries(self):
+        """Load hashes.xlsx from staging and output into in-memory lookup dicts.
+
+        Each dict maps ``file_path`` (as stored in the registry) to
+        ``{'md5_hash': ..., 'phash': ...}``.
+
+        After loading, a reverse index is built for the **output** side so
+        that every staging file can be checked against *all* output files
+        by hash, not just against the file at the same relative path.
         """
-        Ask user to choose an option.
-        
-        Args:
-            question: The question to display
-            options: List of option descriptions
-            default: Default option index
-            
-        Returns:
-            Selected option index
-        """
-        if self.auto_accept:
-            return default
-        
-        print(f"\n{'─'*50}")
-        print(f"CONFLICT: {question}")
-        print(f"{'─'*50}")
-        for i, opt in enumerate(options):
-            marker = " (default)" if i == default else ""
-            print(f"  [{i+1}] {opt}{marker}")
-        
-        while True:
+        for label, base_dir, target in [
+            ('staging', self.staging_dir, '_staging_hashes'),
+            ('output', self.output_dir, '_output_hashes'),
+        ]:
+            reg_path = base_dir / self.REGISTRY_DIR / 'hashes.xlsx'
+            if not reg_path.exists():
+                logger.debug(f"No hashes.xlsx in {label} directory")
+                continue
             try:
-                choice = input(f"\nSelect option [1-{len(options)}] (Enter for default): ").strip()
-                if not choice:
-                    return default
-                idx = int(choice) - 1
-                if 0 <= idx < len(options):
-                    return idx
-                print(f"Please enter a number between 1 and {len(options)}")
-            except (ValueError, EOFError):
-                print(f"Please enter a valid number")
-    
+                df = pd.read_excel(reg_path)
+                cache: Dict[str, Dict[str, str]] = {}
+                for _, row in df.iterrows():
+                    fp = str(row.get('file_path', '')) if pd.notna(row.get('file_path')) else ''
+                    md5 = str(row.get('md5_hash', '')) if pd.notna(row.get('md5_hash')) else ''
+                    phash = str(row.get('phash', '')) if pd.notna(row.get('phash')) else ''
+                    if fp:
+                        cache[fp] = {'md5_hash': md5, 'phash': phash}
+                setattr(self, target, cache)
+                logger.info(f"Loaded {len(cache)} hash entries from {label} hashes.xlsx")
+                print(f"  Loaded {len(cache)} pre-computed hashes from {label}")
+            except Exception as e:
+                logger.warning(f"Failed to load {label} hashes.xlsx: {e}")
+
+        # Build reverse indexes for the output side
+        self._build_output_hash_index()
+
+    def _build_output_hash_index(self):
+        """Build md5→[paths] and phash→[paths] reverse indexes from output hashes.
+
+        This enables O(1) lookup of any staging file's hash against the
+        *entire* output directory — true all-vs-all duplicate detection.
+        """
+        self._output_md5_index.clear()
+        self._output_phash_index.clear()
+        for fp, entry in self._output_hashes.items():
+            md5 = entry.get('md5_hash', '')
+            phash = entry.get('phash', '')
+            if md5:
+                self._output_md5_index.setdefault(md5, []).append(fp)
+            if phash:
+                self._output_phash_index.setdefault(phash, []).append(fp)
+        logger.info(
+            f"Output hash index: {len(self._output_md5_index)} unique MD5s, "
+            f"{len(self._output_phash_index)} unique pHashes"
+        )
+
+    def _find_hash_match_in_output(
+        self, s_md5: str, s_phash: str,
+    ) -> Optional[Tuple[str, DuplicateType]]:
+        """Check whether a staging file's hashes match ANY file in the output.
+
+        Comparison order (same as the orchestrator's ``ImageHasher.are_duplicates``):
+
+        1. **pHash** — exact match → ``PERCEPTUAL``;
+           hamming distance ≤ threshold → ``NEAR``.
+        2. **MD5** — exact match → ``EXACT``.
+
+        Returns:
+            ``(matched_output_path, DuplicateType)`` if a match is found,
+            ``None`` otherwise.
+        """
+        # 1) Exact phash match
+        if s_phash and s_phash in self._output_phash_index:
+            return self._output_phash_index[s_phash][0], DuplicateType.PERCEPTUAL
+
+        # 2) Near-duplicate phash (hamming distance ≤ threshold)
+        if s_phash:
+            for o_phash, o_paths in self._output_phash_index.items():
+                distance = self.image_hasher.hamming_distance(s_phash, o_phash)
+                if 0 < distance <= self.image_hasher.phash_threshold:
+                    return o_paths[0], DuplicateType.NEAR
+
+        # 3) Exact MD5 match
+        if s_md5 and s_md5 in self._output_md5_index:
+            return self._output_md5_index[s_md5][0], DuplicateType.EXACT
+
+        return None
+
+    def _get_file_hashes(self, file_path: Path, side: str) -> Dict[str, str]:
+        """Look up md5/phash for a file, computing only if not in the registry.
+
+        Args:
+            file_path: Absolute path to the file.
+            side: ``'staging'`` or ``'output'`` — which registry to check.
+
+        Returns:
+            ``{'md5_hash': ..., 'phash': ...}``
+        """
+        cache = self._staging_hashes if side == 'staging' else self._output_hashes
+        fp_str = str(file_path)
+
+        if fp_str in cache:
+            entry = cache[fp_str]
+            # Only trust the entry if md5_hash is non-empty
+            if entry.get('md5_hash'):
+                self.stats['hashes_from_registry'] += 1
+                return entry
+
+        # Not found in registry — compute on the fly
+        md5 = self.image_hasher.compute_md5(file_path)
+        phash = ''
+        if file_path.suffix.lower() in IMAGE_EXTENSIONS:
+            phash = self.image_hasher.compute_phash(file_path) or ''
+        self.stats['hashes_computed'] += 1
+
+        result = {'md5_hash': md5, 'phash': phash}
+        cache[fp_str] = result  # cache for later reuse
+        return result
+
     def _should_skip_path(self, rel_path: Path) -> bool:
         """Check if a path should be skipped during file copy."""
         parts = rel_path.parts
@@ -206,7 +331,27 @@ class OutputMerger:
         return False
     
     def _merge_files(self):
-        """Copy non-registry files from staging to output, handling duplicates."""
+        """Copy non-registry files from staging to output, handling duplicates.
+
+        Duplicate detection is **all-vs-all by hash** — every staging file is
+        compared against the entire output directory, not just the file at the
+        same relative path.  Hashes come from ``hashes.xlsx`` when available;
+        only files missing from the registry are hashed on the fly.
+
+        Comparison order (same as the orchestrator's
+        ``ImageHasher.are_duplicates``):
+
+        1. **pHash** — exact match → ``PERCEPTUAL``;
+           hamming distance ≤ threshold → ``NEAR``.
+        2. **MD5** — exact byte-level match → ``EXACT``.
+
+        Decision flow per staging file:
+
+        * Hash matches an output file (anywhere) → **skip** (duplicate).
+        * No hash match but same relative path exists → **file collision**
+          → prompt the user via ``InteractionManager``.
+        * No hash match and path is free → **copy**.
+        """
         print("\n--- Merging Files ---")
         
         # Collect all files in staging (excluding metadata/registries)
@@ -222,69 +367,88 @@ class OutputMerger:
         print(f"  Files to merge: {total}")
         
         for i, (staging_path, rel_path) in enumerate(staging_files):
+            # --- 1. Get staging file's hashes (registry first) ---
+            s_hashes = self._get_file_hashes(staging_path, 'staging')
+            s_md5 = s_hashes['md5_hash']
+            s_phash = s_hashes.get('phash', '')
+            
+            # --- 2. All-vs-all hash match against the entire output ---
+            match = self._find_hash_match_in_output(s_md5, s_phash)
+            
+            if match is not None:
+                matched_path, dup_type = match
+                self.stats['files_skipped_duplicate'] += 1
+                if dup_type == DuplicateType.NEAR:
+                    self.stats['files_skipped_near_duplicate'] += 1
+                logger.debug(
+                    f"Skipping duplicate ({dup_type.value}): "
+                    f"{rel_path} ↔ {matched_path}"
+                )
+                continue
+            
+            # --- 3. No hash match — check for path collision ---
             output_path = self.output_dir / rel_path
             
             if output_path.exists():
-                # File exists in output — check if duplicate
-                staging_md5 = self._compute_md5(staging_path)
-                output_md5 = self._compute_md5(output_path)
+                # Same path exists but hashes differ → true file collision
+                o_hashes = self._get_file_hashes(output_path, 'output')
                 
-                if staging_md5 == output_md5:
-                    # Exact duplicate — skip
-                    self.stats['files_skipped_duplicate'] += 1
-                    logger.debug(f"Skipping exact duplicate: {rel_path}")
+                conflict = MergeConflict(
+                    conflict_type='file_collision',
+                    staging_path=staging_path,
+                    output_path=output_path,
+                    details={
+                        'staging_md5': s_md5,
+                        'output_md5': o_hashes['md5_hash'],
+                        'staging_phash': s_phash,
+                        'output_phash': o_hashes.get('phash', ''),
+                        'staging_size': staging_path.stat().st_size,
+                        'output_size': output_path.stat().st_size,
+                    }
+                )
+                self.conflicts.append(conflict)
+                
+                decision_request = create_merge_file_collision_decision(
+                    staging_path=staging_path,
+                    output_path=output_path,
+                    staging_md5=s_md5,
+                    output_md5=o_hashes['md5_hash'],
+                    staging_size=staging_path.stat().st_size,
+                    output_size=output_path.stat().st_size,
+                )
+                result = self.interaction_manager.request_decision(decision_request)
+                
+                # Map DecisionOutcome to action
+                if result.outcome == DecisionOutcome.DEFER:
+                    self.stats['files_skipped_conflict'] += 1
                     continue
-                else:
-                    # Different file at same path — ask user
-                    conflict = MergeConflict(
-                        conflict_type='file_collision',
-                        staging_path=staging_path,
-                        output_path=output_path,
-                        details={
-                            'staging_md5': staging_md5,
-                            'output_md5': output_md5,
-                            'staging_size': staging_path.stat().st_size,
-                            'output_size': output_path.stat().st_size,
-                        }
-                    )
-                    self.conflicts.append(conflict)
-                    
-                    choice = self._ask_user(
-                        f"File collision: {rel_path}\n"
-                        f"  Staging: {staging_path.stat().st_size} bytes (MD5: {staging_md5[:12]}...)\n"
-                        f"  Output:  {output_path.stat().st_size} bytes (MD5: {output_md5[:12]}...)",
-                        [
-                            "Keep existing (skip staging file)",
-                            "Overwrite with staging file",
-                            "Keep both (rename staging file)",
-                        ],
-                        default=0
-                    )
-                    
-                    if choice == 0:
-                        # Keep existing
-                        self.stats['files_skipped_conflict'] += 1
-                        continue
-                    elif choice == 1:
-                        # Overwrite
-                        if not self.dry_run:
-                            shutil.copy2(staging_path, output_path)
-                        self.stats['files_copied'] += 1
-                    elif choice == 2:
-                        # Keep both — rename staging file
-                        stem = output_path.stem
-                        suffix = output_path.suffix
-                        counter = 1
+                
+                choice = result.selected_option if result.selected_option is not None else 0
+                
+                if choice == 0:
+                    # Keep existing
+                    self.stats['files_skipped_conflict'] += 1
+                    continue
+                elif choice == 1:
+                    # Overwrite
+                    if not self.dry_run:
+                        shutil.copy2(staging_path, output_path)
+                    self.stats['files_copied'] += 1
+                elif choice == 2:
+                    # Keep both — rename staging file
+                    stem = output_path.stem
+                    suffix = output_path.suffix
+                    counter = 1
+                    new_path = output_path.parent / f"{stem}_merged_{counter}{suffix}"
+                    while new_path.exists():
+                        counter += 1
                         new_path = output_path.parent / f"{stem}_merged_{counter}{suffix}"
-                        while new_path.exists():
-                            counter += 1
-                            new_path = output_path.parent / f"{stem}_merged_{counter}{suffix}"
-                        if not self.dry_run:
-                            new_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(staging_path, new_path)
-                        self.stats['files_copied'] += 1
+                    if not self.dry_run:
+                        new_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(staging_path, new_path)
+                    self.stats['files_copied'] += 1
             else:
-                # New file — just copy
+                # --- 4. No hash match, path is free → copy ---
                 if not self.dry_run:
                     output_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(staging_path, output_path)
@@ -296,8 +460,12 @@ class OutputMerger:
         
         print(f"  Files copied: {self.stats['files_copied']}")
         print(f"  Duplicates skipped: {self.stats['files_skipped_duplicate']}")
+        if self.stats['files_skipped_near_duplicate']:
+            print(f"    (of which near-duplicates by phash: {self.stats['files_skipped_near_duplicate']})")
         print(f"  Conflicts resolved: {self.stats['files_skipped_conflict']}")
-    
+        print(f"  Hashes from registry: {self.stats['hashes_from_registry']}")
+        print(f"  Hashes computed on-the-fly: {self.stats['hashes_computed']}")
+
     def _merge_registries(self):
         """Merge Excel registry files from staging into output.
 
@@ -647,9 +815,11 @@ class OutputMerger:
 
             table = self._build_comparison_table(discrepancies, match_reason, context_info=context_info)
 
-            choice = self._ask_merge_conflict(
-                header=f"Merge conflict ({match_reason})",
-                table=table,
+            choice, custom_values = self._resolve_registry_conflict(
+                registry_name='anotaciones.xlsx',
+                match_label=f"Merge conflict ({match_reason})",
+                comparison_table=table,
+                discrepancies=discrepancies,
             )
 
             if choice == 0:
@@ -660,12 +830,11 @@ class OutputMerger:
                 for col in discrepancies:
                     if not self.dry_run:
                         o_ann.at[matched_idx, col] = s_row[col]
-            elif choice == 2:
+            elif choice == 2 and custom_values:
                 # Custom per field
-                for col, d in discrepancies.items():
-                    custom_val = self._ask_custom_field(col, d['output'], d['staging'])
-                    if custom_val is not None and not self.dry_run:
-                        o_ann.at[matched_idx, col] = custom_val
+                for col, val in custom_values.items():
+                    if not self.dry_run:
+                        o_ann.at[matched_idx, col] = val
             elif choice == -1:
                 # Defer — keep output as-is for now
                 pass
@@ -723,60 +892,62 @@ class OutputMerger:
     # Merge conflict UI  ([0] existing / [1] staging / [2] custom / [d] defer)
     # ------------------------------------------------------------------
 
-    def _ask_merge_conflict(self, header: str, table: str) -> int:
-        """Prompt the user about a merge conflict.
+    def _resolve_registry_conflict(
+        self,
+        registry_name: str,
+        match_label: str,
+        comparison_table: str,
+        discrepancies: Dict[str, Dict[str, str]],
+        context_info: Optional[Dict[str, str]] = None,
+    ) -> Tuple[int, Optional[Dict[str, str]]]:
+        """Ask the user to resolve a registry merge conflict via InteractionManager.
 
         Returns:
-            0  – keep existing (output)
-            1  – use staging values
-            2  – enter custom value per field
-            -1 – defer
+            (choice, custom_values)
+            choice:
+              0  - keep existing (output)
+              1  - use staging values
+              2  - custom per field (custom_values dict is populated)
+              -1 - defer
+            custom_values: only set when choice == 2
         """
-        if self.auto_accept:
-            return 0  # keep existing is the safe default
+        decision_request = create_merge_registry_conflict_decision(
+            registry_name=registry_name,
+            match_label=match_label,
+            comparison_table=comparison_table,
+            context_info=context_info,
+        )
+        result = self.interaction_manager.request_decision(decision_request)
 
-        print(f"\n{'─'*60}")
-        print(f"CONFLICT: {header}")
-        print(f"{'─'*60}")
-        print(table)
-        print()
-        print("  [0] Keep existing (output) values")
-        print("  [1] Use staging values")
-        print("  [2] Enter custom value for each field")
-        print("  [d] Defer (leave for later)")
+        if result.outcome == DecisionOutcome.DEFER:
+            return -1, None
 
-        while True:
-            try:
-                choice = input("\nEnter choice (0, 1, 2, d): ").strip().lower()
-                if choice == '0':
-                    return 0
-                elif choice == '1':
-                    return 1
-                elif choice == '2':
-                    return 2
-                elif choice == 'd':
-                    return -1
+        choice = result.selected_option if result.selected_option is not None else 0
+
+        if choice == 2:
+            # Custom per field — prompt inline (or auto-keep-existing in auto mode)
+            custom_values = {}
+            if self.interaction_manager.mode == InteractionMode.AUTO_ACCEPT:
+                # Auto mode: keep existing
+                return 0, None
+            for col, d in discrepancies.items():
+                print(f"\n  {col}:  [0] existing = '{d['output']}'  |  [1] staging = '{d['staging']}'")
+                val = input(f"  Enter value for '{col}' (or 0/1 to pick): ").strip()
+                if val == '0':
+                    custom_values[col] = d['output']
+                elif val == '1':
+                    custom_values[col] = d['staging']
+                elif val:
+                    custom_values[col] = val
                 else:
-                    print("Invalid input. Enter 0, 1, 2, or d.")
-            except (KeyboardInterrupt, EOFError):
-                print("\nDeferred.")
-                return -1
+                    custom_values[col] = d['output']  # default: keep existing
+            return 2, custom_values
 
-    def _ask_custom_field(
-        self, field_name: str, output_val: str, staging_val: str,
-    ) -> Optional[str]:
-        """Ask the user for a custom value for a single field."""
-        if self.auto_accept:
-            return None  # keep existing
-        print(f"\n  {field_name}:  [0] existing = '{output_val}'  |  [1] staging = '{staging_val}'")
-        val = input(f"  Enter value for '{field_name}' (or 0/1 to pick): ").strip()
-        if val == '0':
-            return output_val
-        elif val == '1':
-            return staging_val
-        elif val:
-            return val
-        return None  # keep existing
+        if choice == 3:
+            # "Defer" option in the options list
+            return -1, None
+
+        return choice, None
 
     # ------------------------------------------------------------------
     # Comparison-table builder (merge conflict UI)
@@ -973,14 +1144,11 @@ class OutputMerger:
 
                 table = self._build_comparison_table(discrepancies, match_display, context_info=ctx_info)
 
-                choice = self._ask_user(
-                    f"Registry conflict in {registry_name} ({match_display}):\n{table}",
-                    [
-                        "Keep existing values",
-                        "Use staging values",
-                        "Merge (staging fills gaps, keep existing where both have values)",
-                    ],
-                    default=2,
+                choice, custom_values = self._resolve_registry_conflict(
+                    registry_name=registry_name,
+                    match_label=match_display,
+                    comparison_table=table,
+                    discrepancies=discrepancies,
                 )
 
                 if choice == 1:
@@ -988,13 +1156,15 @@ class OutputMerger:
                         if not self.dry_run:
                             output_df.at[output_idx, col] = staging_row[col]
                     rows_updated += 1
-                elif choice == 2:
-                    for col, d in discrepancies.items():
-                        if not d['output']:
-                            if not self.dry_run:
-                                output_df.at[output_idx, col] = staging_row[col]
+                elif choice == 2 and custom_values:
+                    for col, val in custom_values.items():
+                        if not self.dry_run:
+                            output_df.at[output_idx, col] = val
                     rows_updated += 1
-                # choice == 0: keep existing
+                elif choice == 0 or choice == -1:
+                    pass  # keep existing
+                # Note: the old "merge" option (choice 2) that filled gaps is
+                # already handled above by the auto-merge logic for empty fields.
 
                 conflicts_resolved += 1
                 self.stats['registry_conflicts'] += 1
@@ -1071,7 +1241,7 @@ class OutputMerger:
         print(f"Staging:  {self.staging_dir}")
         print(f"Output:   {self.output_dir}")
         print(f"Dry run:  {self.dry_run}")
-        print(f"Auto:     {self.auto_accept}")
+        print(f"Mode:     {self.interaction_manager.mode.value}")
         
         # Validate
         if not self.staging_dir.exists():
@@ -1079,6 +1249,9 @@ class OutputMerger:
         
         if not self.dry_run:
             self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Step 0: Load pre-computed hashes from both registries
+        self._load_hash_registries()
         
         # Step 1: Merge files
         self._merge_files()
@@ -1095,9 +1268,13 @@ class OutputMerger:
         print(f"{'='*60}")
         print(f"  Files copied:            {self.stats['files_copied']}")
         print(f"  Duplicates skipped:      {self.stats['files_skipped_duplicate']}")
+        if self.stats['files_skipped_near_duplicate']:
+            print(f"    (near-duplicates):     {self.stats['files_skipped_near_duplicate']}")
         print(f"  Conflicts (files):       {self.stats['files_skipped_conflict']}")
         print(f"  Registry records merged: {self.stats['registry_records_merged']}")
         print(f"  Registry conflicts:      {self.stats['registry_conflicts']}")
+        print(f"  Hashes from registry:    {self.stats['hashes_from_registry']}")
+        print(f"  Hashes computed:         {self.stats['hashes_computed']}")
         print(f"  Errors:                  {self.stats['errors']}")
         
         if not self.dry_run and self.stats['errors'] == 0:
@@ -1154,6 +1331,13 @@ Examples:
     )
     
     parser.add_argument(
+        '--mode', '-m',
+        choices=['interactive', 'deferred', 'auto_accept', 'step_by_step'],
+        default=None,
+        help='Interaction mode (overrides --auto). Same modes as the main orchestrator.'
+    )
+    
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Enable verbose output'
@@ -1186,6 +1370,7 @@ def main():
             output_dir=args.output.resolve() if args.output else None,
             dry_run=args.dry_run,
             auto_accept=args.auto,
+            interaction_mode=getattr(args, 'mode', None),
         )
         
         stats = merger.merge()
