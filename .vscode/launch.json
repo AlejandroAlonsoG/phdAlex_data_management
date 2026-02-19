@@ -29,6 +29,24 @@
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "justMyCode": false
+        },
+        {
+            "name": "Merge Output (staging→output)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "data_ordering.merge_output",
+            "args": [
+                "--staging",
+                "C:\\merge_1j",
+                "--output",
+                "C:\\merge_2e"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
         }
     ]
 }

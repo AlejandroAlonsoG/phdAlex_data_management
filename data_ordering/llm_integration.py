@@ -39,8 +39,8 @@ except ImportError:
     pass
 
 try:
-    import google.generativeai as genai
-    from google.generativeai.types import GenerationConfig, ThinkingConfig
+    from google import genai
+    from google.genai import types
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
@@ -342,12 +342,22 @@ Buenache (BUE): Prefixes are K-BUE, CER-BUE
 Montsec (MON): More prefixes to be confirmed
 
 === CAMPAIGN YEARS ===
-Look for 4-digit years (2018, 2019, 2020, etc.) in path.
+Look for 4-digit years (2018, 2019, 2020, etc.) in path. Pay special attention to date formats on the path, or folder names indicating the year.
 
 The output schema is enforced automatically. Fill each field based on the rules above."""
 
 
-FILENAME_REGEX_PROMPT = """You are an expert at creating regex patterns for parsing fossil specimen filenames.
+def _build_prefix_list_text() -> str:
+    prefixes = getattr(config, 'ALL_SPECIMEN_PREFIXES', ()) or ()
+    if prefixes:
+        return ', '.join(prefixes)
+    return 'LH, MCLM, MCLM-LH, ADR, K-BUE, CER-BUE'
+
+
+def get_filename_regex_prompt() -> str:
+    """Return the filename-regex prompt with prefixes injected from config."""
+    prefix_list = _build_prefix_list_text()
+    return f"""You are an expert at creating regex patterns for parsing fossil specimen filenames.
 
 Given sample filenames, create regex patterns with NAMED GROUPS to extract:
 1. specimen_id: The unique specimen identifier in format: PREFIX-NUMERIC[-PLATE]
@@ -356,7 +366,7 @@ Given sample filenames, create regex patterns with NAMED GROUPS to extract:
 3. plate: Plate indicator if present (a, A, b, B, aB, Ab, AB)
 
 SPECIMEN ID STRUCTURE:
-- Prefix: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE (Buenache)
+- Prefix: {prefix_list}. Only these prefixes are considered specimen IDs; other prefixes are likely camera-generated and should not be considered specimen IDs.
 - Numeric: 1-10 digits (e.g., 5, 12345, 87654321)
 - Plate: Optional - only a, A, b, B, aB, Ab, AB (lowercase preferred)
 - Separators: space, hyphen, underscore, forward slash, or none
@@ -379,13 +389,16 @@ REGEX GUIDELINES:
 The output schema is enforced automatically. Fill each field based on the guidelines above."""
 
 
-FILE_ANALYSIS_PROMPT = """You are an expert paleontologist. Extract information from this single fossil image filename.
+def get_file_analysis_prompt() -> str:
+    """Return the file-analysis prompt with prefixes from config injected."""
+    prefixes = _build_prefix_list_text()
+    return f"""You are an expert paleontologist. Extract information from this single fossil image filename.
 
 This is a FALLBACK analysis when regex patterns failed. Be as accurate as possible.
 
 SPECIMEN ID FORMATS:
 Specimen IDs follow the structure: PREFIX-NUMERIC[-PLATE]
-- Prefix options: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE, (Buenache)
+- Prefix options: {prefixes}
 - Numeric: 1-10 digits (e.g., 5, 12345, 87654321)
 - Plate: Optional single letter or pair (a, A, b, B, aB, Ab, AB)
 - Examples: "LH-12345", "MCLM-87654321-a", "K-BUE-999-b"
@@ -436,8 +449,8 @@ PATH_ANALYSIS_SCHEMA = {
         },
         "collection_code": {
             "type": "string",
-            "enum": ["LH", "BUE", "MON", "unknown"],
-            "description": "Collection site: LH=Las Hoyas, BUE=Buenache, MON=Montsec. Use 'unknown' if not determinable."
+            "enum": ["LH", "BUE", "MON"],
+            "description": "Collection site: LH=Las Hoyas, BUE=Buenache, MON=Montsec. If not determinable, asume LH."
         },
         "confidence": {
             "type": "number",
@@ -508,8 +521,8 @@ FILE_ANALYSIS_SCHEMA = {
         },
         "collection_code": {
             "type": "string",
-            "enum": ["LH", "BUE", "MON", "unknown"],
-            "description": "Collection site: LH=Las Hoyas, BUE=Buenache, MON=Montsec. Use 'unknown' if not determinable."
+            "enum": ["LH", "BUE", "MON"],
+            "description": "Collection site: LH=Las Hoyas, BUE=Buenache, MON=Montsec. If not determinable, assume LH."
         },
         "confidence": {
             "type": "number",
@@ -572,6 +585,53 @@ def _convert_node(node: dict) -> dict:
         node["items"] = _convert_node(node["items"])
     
     return node
+
+
+def _normalize_extraction(extracted: dict, match: re.Match = None) -> dict:
+    """Normalize extracted fields from a regex match to canonical specimen_id format.
+
+    Rules:
+    - prefix: leave as extracted
+    - numeric part: leave as extracted
+    - separators: always use '-'
+    - plate: always lowercase
+    """
+    res = dict(extracted or {})
+
+    # Lowercase plate if present
+    if 'plate' in res and res.get('plate'):
+        res['plate'] = res['plate'].lower()
+
+    specimen_raw = res.get('specimen_id')
+    # Try to parse specimen_id if present
+    if specimen_raw:
+        m = re.match(r"^\s*(?P<prefix>[A-Za-z0-9\-]+)[-\s_/]*(?P<number>\d{1,10})(?:[-\s_/]*(?P<plate>[A-Za-z]{1,2}))?\s*$",
+                     specimen_raw)
+        if m:
+            prefix = m.group('prefix')
+            number = m.group('number')
+            plate = m.group('plate').lower() if m.group('plate') else None
+            specimen_id = f"{prefix}-{number}" + (f"-{plate}" if plate else "")
+            res['specimen_id'] = specimen_id
+            res['prefix'] = prefix
+            res['number'] = number
+            res['plate'] = plate
+            return res
+
+    # If specimen_id was not present or parsing failed, try to assemble from components
+    prefix = res.get('prefix') or res.get('specimen_prefix') or res.get('collection')
+    number = res.get('number') or res.get('numeric') or res.get('id') or res.get('specimen_number')
+    if prefix and number:
+        plate = res.get('plate') or res.get('p') or None
+        if plate:
+            plate = plate.lower()
+        specimen_id = f"{prefix}-{number}" + (f"-{plate}" if plate else "")
+        res['specimen_id'] = specimen_id
+        res['prefix'] = prefix
+        res['number'] = number
+        res['plate'] = plate
+
+    return res
 
 
 # =============================================================================
@@ -646,14 +706,27 @@ Remember to convert Spanish taxonomic terms to scientific names."""
         try:
             response_text = self._call_api(PATH_ANALYSIS_PROMPT, user_prompt, schema_name='path_analysis')
             data = self._parse_json(response_text)
-            
+
+            # Normalize campaign_year: allow integers or numeric strings (e.g. "2005").
+            cy = data.get('campaign_year')
+            if cy is not None:
+                try:
+                    # Some LLMs may return the year as a string or with stray chars
+                    cy = int(str(cy).strip())
+                except Exception:
+                    cy = None
+
+            # If year wasn't extracted, keep the raw response for debugging
+            if cy is None:
+                logger.debug(f"Path analysis did not include campaign_year. Raw response: {response_text[:1000]}")
+
             return PathAnalysis(
                 macroclass=data.get('macroclass'),
                 taxonomic_class=data.get('taxonomic_class'),
                 genus=data.get('genus'),
-                campaign_year=data.get('campaign_year'),
+                campaign_year=cy,
                 specimen_id=data.get('specimen_id'),
-                collection_code=data.get('collection_code', 'unknown'),
+                collection_code=data.get('collection_code', 'LH'),
                 directory_path=str(directory_path),
                 confidence=float(data.get('confidence', 0)),
                 raw_response=response_text,
@@ -701,7 +774,7 @@ Create regex patterns with named groups to extract specimen_id, year, and plate 
             user_prompt += f"\n\n{refinement_context}"
 
         try:
-            response_text = self._call_api(FILENAME_REGEX_PROMPT, user_prompt, schema_name='filename_regex')
+            response_text = self._call_api(get_filename_regex_prompt(), user_prompt, schema_name='filename_regex')
             data = self._parse_json(response_text)
             
             return FilenameRegexResult(
@@ -764,7 +837,9 @@ Create regex patterns with named groups to extract specimen_id, year, and plate 
                             extracted = {
                                 'specimen_id': match.group(1) if match.groups() else match.group(0)
                             }
-                        successes[fn] = extracted
+                        # Normalize the extraction to canonical specimen_id format
+                        normalized = _normalize_extraction(extracted, match)
+                        successes[fn] = normalized
                     else:
                         failures.append(fn)
                         
@@ -830,7 +905,7 @@ Filename: {filename}
 Extract any specimen ID, year, or taxonomic information encoded in the filename."""
 
         try:
-            response_text = self._call_api(FILE_ANALYSIS_PROMPT, user_prompt, schema_name='file_analysis')
+            response_text = self._call_api(get_file_analysis_prompt(), user_prompt, schema_name='file_analysis')
             data = self._parse_json(response_text)
             
             return FileAnalysis(
@@ -839,7 +914,7 @@ Extract any specimen ID, year, or taxonomic information encoded in the filename.
                 campaign_year=data.get('campaign_year'),
                 taxonomic_class=data.get('taxonomic_class'),
                 genus=data.get('genus'),
-                collection_code=data.get('collection_code', 'unknown'),
+                collection_code=data.get('collection_code', 'LH'),
                 confidence=float(data.get('confidence', 0)),
                 raw_response=response_text,
             )
@@ -1070,9 +1145,9 @@ class GeminiClient(BaseLLMClient):
     
     # Thinking levels mapped to task complexity
     THINKING_LEVELS = {
-        'path_analysis': 'low',           # Quick thinking - fast path analysis
-        'filename_regex': 'low',          # Quick thinking - fast regex generation
-        'file_analysis': 'low',           # Quick thinking - simple filename parsing
+        'path_analysis': 'MINIMAL',           # Quick thinking - fast path analysis
+        'filename_regex': 'MINIMAL',          # Quick thinking - fast regex generation
+        'file_analysis': 'MINIMAL',           # Quick thinking - simple filename parsing
     }
     
     def __init__(
@@ -1086,7 +1161,7 @@ class GeminiClient(BaseLLMClient):
         
         if not GENAI_AVAILABLE:
             raise ImportError(
-                "google-generativeai not installed. Install with: pip install google-generativeai"
+                "google-genai not installed. Install with: pip install -U google-genai"
             )
         
         self.api_key = api_key or os.environ.get(config.llm_api_key_env_var)
@@ -1096,8 +1171,8 @@ class GeminiClient(BaseLLMClient):
         self.model_name = model or config.llm_model
         self.enable_thinking = enable_thinking
         
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(self.model_name)
+        # Initialize the new google.genai client with API key
+        self.client = genai.Client(api_key=self.api_key)
         
         logger.info(
             f"Initialized Gemini client with model {self.model_name} "
@@ -1107,34 +1182,41 @@ class GeminiClient(BaseLLMClient):
     def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
         """Make API call with structured output and thinking support.
         
-        Uses Gemini's response_schema parameter when a schema_name is provided,
+        Uses Gemini's response_mime_type and response_json_schema parameters when a schema_name is provided,
         guaranteeing the response matches the schema. Applies appropriate thinking
-        level based on task complexity (schema_name).
+        level based on task complexity (schema_name) to limit model reasoning.
         """
         logger.debug(f"[LLM_REQUEST] schema={schema_name} | prompt={user_prompt[:300]}")
         
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
         
-        gen_config_kwargs = {
-            "temperature": 0.1,
-            "max_output_tokens": 2048,
-            "response_mime_type": "application/json",
+        # Build the config dictionary
+        config_kwargs = {
+            "temperature": 0.1,  # Low temperature for deterministic outputs
+            "max_output_tokens": 8192,
         }
         
-        # Add thinking configuration if enabled
+        # Add structured output configuration if schema available
+        if schema_name and schema_name in _SCHEMAS:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_json_schema"] = _SCHEMAS[schema_name]
+            logger.debug(f"[STRUCTURED_OUTPUT] schema={schema_name}")
+        
+        # Add thinking configuration if enabled (limits how much the model thinks)
         if self.enable_thinking and schema_name in self.THINKING_LEVELS:
             thinking_level = self.THINKING_LEVELS[schema_name]
-            gen_config_kwargs["thinking_config"] = ThinkingConfig(
-                thinking_level=thinking_level
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=thinking_level,
             )
             logger.debug(f"[THINKING] schema={schema_name} | level={thinking_level}")
         
-        if schema_name and schema_name in _SCHEMAS:
-            gen_config_kwargs["response_schema"] = _SCHEMAS[schema_name]
+        # Create the GenerateContentConfig with all parameters
+        generate_config = types.GenerateContentConfig(**config_kwargs)
         
-        response = self.model.generate_content(
-            full_prompt,
-            generation_config=GenerationConfig(**gen_config_kwargs)
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=full_prompt,
+            config=generate_config
         )
         
         result = response.text
@@ -1337,7 +1419,7 @@ class MockLLMClient(BaseLLMClient):
         user_lower = user_prompt.lower()
         
         # Detect collection from path
-        collection = "unknown"
+        collection = "LH"  # Default to LH if not detected
         if any(x in user_lower for x in ['lh', 'las hoyas', 'colección lh', 'mupa', 'yclh']):
             collection = "LH"
         elif any(x in user_lower for x in ['buenache', 'bue', 'k-bue']):
@@ -1514,7 +1596,7 @@ def get_llm_client(provider: str = None) -> BaseLLMClient:
         return MockLLMClient()
     else:
         if not GENAI_AVAILABLE:
-            raise ImportError("google-generativeai not installed for Gemini.")
+            raise ImportError("google-genai not installed for Gemini. Install with: pip install -U google-genai")
         return GeminiClient()
 
 

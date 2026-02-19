@@ -165,9 +165,13 @@ class InteractionManager:
         print(f"\n{request.message}")
         
         is_dup_meta = (request.decision_type == DecisionType.DUPLICATE_METADATA_DISCREPANCY)
+        # Support the "apply to subdirectory" shortcut for a few decision
+        # types where the same choice makes sense across many files.
         supports_subdir = (request.decision_type in (
             DecisionType.SOURCE_DISCREPANCY,
             DecisionType.CAMERA_NUMBER_FLAG,
+            DecisionType.MERGE_FILE_COLLISION,
+            DecisionType.MERGE_REGISTRY_CONFLICT,
         ))
         
         # Show context only for non-table decision types (table is already in the message)
@@ -757,6 +761,8 @@ def create_merge_file_collision_decision(
     output_md5: str,
     staging_size: int,
     output_size: int,
+    context_info: Optional[Dict[str, str]] = None,
+    extra_message: Optional[str] = None,
 ) -> DecisionRequest:
     """Create a decision request for a file collision during merge.
 
@@ -771,7 +777,7 @@ def create_merge_file_collision_decision(
             f"File collision during merge: {rel}\n"
             f"  Staging: {staging_size:,} bytes (MD5: {staging_md5[:12]}…)\n"
             f"  Output:  {output_size:,} bytes (MD5: {output_md5[:12]}…)"
-        ),
+        ) + ("\n\n" + extra_message if extra_message else ""),
         context={
             'staging_path': str(staging_path),
             'output_path': str(output_path),
@@ -779,6 +785,7 @@ def create_merge_file_collision_decision(
             'output_md5': output_md5,
             'staging_size': staging_size,
             'output_size': output_size,
+            **(context_info or {}),
         },
         options=[
             "Keep existing (skip staging file)",

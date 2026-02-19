@@ -177,6 +177,12 @@ class SpecimenIdExtractor:
             r'(?<![0-9])(\d{3,8})\s*[-_]?\s*([aAbB]{1,2})?(?![0-9])',
             re.IGNORECASE
         )
+
+        # Regex to detect camera-like filenames that start with camera prefixes
+        # followed by digits (e.g., PA210066). Used to avoid inferring
+        # specimen IDs from camera file names.
+        cam_prefixes_esc = '|'.join(re.escape(p) for p in sorted(self.CAMERA_PREFIXES, key=len, reverse=True))
+        self.camera_prefixed_filename = re.compile(rf'^(?:{cam_prefixes_esc})\d+', re.IGNORECASE)
     
     def extract(self, path: Path) -> Optional[SpecimenIdMatch]:
         """
@@ -207,9 +213,16 @@ class SpecimenIdExtractor:
                 return match
         
         # Try numeric-only in filename (when prefix might be in path)
+        # Avoid inferring numeric-only specimen IDs from filenames that are
+        # clearly camera-generated (e.g., PA290080). These should be treated
+        # as camera file numbers, not specimen IDs even if a collection prefix
+        # exists in the directory path.
+        if self.camera_prefixed_filename.match(filename):
+            return None
+
         prefix_in_path = self._find_prefix_in_path(path)
         if prefix_in_path:
-            match = self._try_numeric_only(filename, prefix_in_path, PatternSource.FILENAME)
+            match = self._try_numeric_only(filename, prefix_in_path, PatternSource.FILENAME, prefix_from_path=True)
             if match:
                 return match
         
@@ -228,6 +241,19 @@ class SpecimenIdExtractor:
             # Filter out camera prefixes - ALWAYS check, not just for loose pattern
             if prefix in self.CAMERA_PREFIXES:
                 return None
+
+            # If the match came from a PATH component, it's possible the
+            # numeric part is actually a year (e.g., "MCCM_2009" folders).
+            # In that case, prefer treating it as campaign/date info and
+            # do NOT consider it a specimen ID. Reject 4-digit years in
+            # the range 1980-2026 when the source is PATH.
+            if source == PatternSource.PATH and len(numeric) == 4:
+                try:
+                    year_val = int(numeric)
+                    if 1980 <= year_val <= 2026:
+                        return None
+                except ValueError:
+                    pass
 
             # If using the loose pattern, require the prefix to be one of the
             # known specimen prefixes from configuration. This prevents two-
@@ -274,13 +300,26 @@ class SpecimenIdExtractor:
         return None
     
     def _try_numeric_only(self, text: str, prefix: str, 
-                          source: PatternSource) -> Optional[SpecimenIdMatch]:
+                          source: PatternSource,
+                          prefix_from_path: bool = False) -> Optional[SpecimenIdMatch]:
         """Try to extract numeric ID when prefix is in path."""
         m = self.numeric_only_pattern.search(text)
         if m:
             numeric = m.group(1)
             plate = m.group(2).lower() if m.group(2) else None
             
+            # If the prefix was found in the path (not the filename), and
+            # the numeric-only match looks like a 4-digit year within a
+            # realistic campaign range, do not infer a specimen ID from
+            # the filename's number. This avoids creating IDs like
+            # "MCCM-2009" when the folder is actually a campaign year.
+            if prefix_from_path and len(numeric) == 4:
+                try:
+                    year_val = int(numeric)
+                    if 1980 <= year_val <= 2026:
+                        return None
+                except ValueError:
+                    pass
 
             
             specimen_id = f"{prefix}-{numeric}"

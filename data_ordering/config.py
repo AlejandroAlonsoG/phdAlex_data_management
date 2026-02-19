@@ -146,9 +146,11 @@ JPEG_QUALITY = 95  # Quality for JPEG conversion (1-100)
 
 # Image extensions that PIL/Pillow can reliably open and convert to JPEG.
 # For formats NOT in this set, ImageMagick will be used as a fallback.
+# RAW formats (.nef, .cr2, .orf, etc.) are converted to JPEG by ImageMagick.
 PIL_CONVERTIBLE_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif',
     '.webp', '.psd',  # Pillow reads flattened PSD
+    '.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2', '.raw',  # RAW formats (via ImageMagick)
 }
 
 TEXT_EXTENSIONS = {
@@ -181,7 +183,7 @@ COLLECTIONS = {
     'las_hoyas': CollectionConfig(
         name="Las Hoyas",
         code="LH",
-        prefixes=('LH', 'MCLM', 'MCLM-LH', 'ADR'),
+        prefixes=('LH', 'MCLM', 'MCLM-LH', 'MCCM', 'MCCMLH', 'MCCM-LH', 'ADR'),
         path_keywords=('las hoyas', 'lashoyas', 'hoyas', 'colección lh'),
     ),
     'buenache': CollectionConfig(
