@@ -183,7 +183,7 @@ COLLECTIONS = {
     'las_hoyas': CollectionConfig(
         name="Las Hoyas",
         code="LH",
-        prefixes=('LH', 'MCLM', 'MCLM-LH', 'MCCM', 'MCCMLH', 'MCCM-LH', 'ADR'),
+        prefixes=('LH', 'MCLM', 'MCLM-LH', 'MCCM', 'MCCMLH', 'MCCM-LH', 'ADR', 'PB'),
         path_keywords=('las hoyas', 'lashoyas', 'hoyas', 'colección lh'),
     ),
     'buenache': CollectionConfig(

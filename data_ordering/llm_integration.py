@@ -345,6 +345,12 @@ Las Hoyas (LH): Prefixes are LH, MCLM, MCLM-LH, or ADR
 Buenache (BUE): Prefixes are K-BUE, CER-BUE
 Montsec (MON): More prefixes to be confirmed
 
+=== SPECIMEN IDs ===
+A specimen ID MUST contain PREFIX + NUMERIC part (e.g. "LH-12345", "K-BUE-999").
+A bare prefix like "LH" alone is NOT a valid specimen ID — return null if no number is present.
+The plate/part indicator (a, b, ab) is OPTIONAL. Include it only when visible: "LH-12345-ab". Many IDs have no plate and that is valid: "LH-12345".
+Output format: PREFIX (uppercase) - NUMBER - optionally plate (lowercase).
+
 === CAMPAIGN YEARS ===
 Look for 4-digit years (2018, 2019, 2020, etc.) in path. Pay special attention to date formats on the path, or folder names indicating the year.
 
@@ -375,20 +381,29 @@ SPECIMEN ID STRUCTURE:
 - Plate: Optional - only a, A, b, B, aB, Ab, AB (lowercase preferred)
 - Separators: space, hyphen, underscore, forward slash, or none
 
+CRITICAL RULES:
+- A specimen ID MUST ALWAYS contain a numeric part. A bare prefix like "LH" or "MCLM" alone is NOT a valid specimen ID. If you cannot find a number after the prefix, return null.
+- The plate/part indicator (a, b, ab) is OPTIONAL. Many specimens do NOT have one, and that is perfectly valid (e.g. "LH-12345"). However, when present, the plate encodes which side of the specimen is shown (a=front, b=back, ab=both). Your regex must capture it when it exists (look for a/b/ab immediately after the number, possibly separated by space/hyphen/underscore), but do NOT invent a plate if none is visible in the filename.
+- Output format: PREFIX in UPPERCASE, hyphen, number, and optionally hyphen + plate in lowercase. Examples: "LH-12345", "LH-12345-ab"
+
 COMMON FILENAME PATTERNS:
-- "LH-12345.jpg" → specimen_id = "LH-12345"
-- "LH 12345a.tif" → specimen_id = "LH-12345-a"
-- "MCLM-87654321-b.jpg" → specimen_id = "MCLM-87654321-b"
-- "K-BUE_999_AB.tif" → specimen_id = "K-BUE-999-ab"
-- "specimen_2019_LH_12345.jpg" → campaign_year = 2019, specimen_id = "LH-12345"
+- "LH-12345.jpg" → specimen_id = "LH-12345" (no plate)
+- "LH 6120.jpg" → specimen_id = "LH-6120" (no plate)
+- "LH 12345a.tif" → specimen_id = "LH-12345-a" (plate a)
+- "LH12345AB.JPG" → specimen_id = "LH-12345-ab" (plate ab)
+- "LH 30202 AB.JPG" → specimen_id = "LH-30202-ab" (plate ab)
+- "MCLM-87654321-b.jpg" → specimen_id = "MCLM-87654321-b" (plate b)
+- "K-BUE_999_AB.tif" → specimen_id = "K-BUE-999-ab" (plate ab)
+- "specimen_2019_LH_12345.jpg" → campaign_year = 2019, specimen_id = "LH-12345" (no plate)
 - "DSC00001.jpg" → likely camera-generated, not a specimen ID
+- "LH.jpg" → NO specimen ID (bare prefix without number)
 
 REGEX GUIDELINES:
 - Use Python regex syntax
 - Use named groups: (?P<name>pattern)
 - Make patterns flexible for spaces/hyphens/underscores: [-\\s_]?
-- Handle optional plate indicators: (?P<plate>[aAbB]{1,2})?
-- Example: r"(?P<specimen_id>(LH|MCLM|ADR)[-\\s_]?\\d{1,10})(?:\\s*(?P<plate>[aAbB]{1,2}))?"
+- ALWAYS include the plate capture group: (?P<plate>[aAbB]{{1,2}})?
+- Example: r"(?P<specimen_id>(LH|MCLM|ADR)[-\\s_]?\\d{{1,10}})(?:\\s*[-_]?\\s*(?P<plate>[aAbB]{{1,2}}))?"
 
 The output schema is enforced automatically. Fill each field based on the guidelines above."""
 
@@ -403,9 +418,12 @@ This is a FALLBACK analysis when regex patterns failed. Be as accurate as possib
 SPECIMEN ID FORMATS:
 Specimen IDs follow the structure: PREFIX-NUMERIC[-PLATE]
 - Prefix options: {prefixes}
-- Numeric: 1-10 digits (e.g., 5, 12345, 87654321)
-- Plate: Optional single letter or pair (a, A, b, B, aB, Ab, AB)
-- Examples: "LH-12345", "MCLM-87654321-a", "K-BUE-999-b"
+- Numeric: 1-10 digits (e.g., 5, 12345, 87654321). A number MUST be present — a bare prefix like "LH" alone is NOT a valid specimen ID.
+- Plate: Optional single letter or pair (a, A, b, B, aB, Ab, AB). Many specimens do NOT have a plate and that is valid. When present, it indicates which side of the specimen is shown. Look for letters a/b/ab right after the number, but do NOT invent one if none is visible.
+- Output format: PREFIX (uppercase) - NUMBER - optionally plate (lowercase). Examples: "LH-12345", "LH-6120", "MCLM-87654321-a", "K-BUE-999-ab"
+
+CRITICAL: If the filename only contains a prefix without any number (e.g. "LH.jpg"), return null for specimen_id.
+CRITICAL: If a plate IS present, do not miss it. "LH 12345a" → "LH-12345-a", "LH32560AB" → "LH-32560-ab". But "LH 6120.jpg" → "LH-6120" (no plate, and that is fine).
 
 Examples of camera numbers (NOT specimen IDs):
 - DSC00001, IMG_1234, DSCN5678, _MG_7890, DJI_0042
@@ -449,7 +467,7 @@ PATH_ANALYSIS_SCHEMA = {
         "specimen_id": {
             "type": "string",
             "nullable": True,
-            "description": "Specimen identifier if directly visible in the directory path in format PREFIX-NUMERIC[-PLATE] (e.g. LH-12345, MCLM-87654321-a). Null if not present in path."
+            "description": "Specimen identifier if directly visible in the directory path in format PREFIX-NUMERIC[-PLATE] (e.g. LH-12345, MCLM-87654321-a). MUST include the numeric part; a bare prefix like 'LH' alone is NOT valid — return null instead. Null if not present in path."
         },
         "collection_code": {
             "type": "string",
@@ -475,7 +493,7 @@ FILENAME_REGEX_SCHEMA = {
         "specimen_id_regex": {
             "type": "string",
             "nullable": True,
-            "description": "Python regex with a capture group to extract specimen ID only. E.g. r'(LH[-\\s]?\\d{3,8})' or r'(K-Bue[-\\s]?\\d+)'. Null if specimen ID is not extractable."
+            "description": "Python regex with named capture groups to extract specimen ID including the plate/part suffix. Must capture prefix+number AND plate separately. E.g. r'(?P<specimen_id>(?:LH|MCLM|ADR)[-\\s_]?\\d{1,10})[-\\s_]?(?P<plate>[aAbB]{1,2})?' Null if specimen ID is not extractable."
         },
         "campaign_year_regex": {
             "type": "string",
@@ -506,7 +524,7 @@ FILE_ANALYSIS_SCHEMA = {
         "specimen_id": {
             "type": "string",
             "nullable": True,
-            "description": "Extracted specimen ID in format PREFIX-NUMERIC[-PLATE]. Examples: 'LH-12345', 'MCLM-87654321-a', 'K-BUE-999-b', 'ADR-5'. Valid prefixes: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE (Buenache). Null if not identifiable."
+            "description": "Extracted specimen ID in format PREFIX-NUMERIC[-PLATE] with prefix in UPPERCASE and plate in lowercase. Examples: 'LH-12345', 'MCLM-87654321-a', 'K-BUE-999-ab'. MUST include a numeric part — a bare prefix like 'LH' alone is NOT valid (return null). Always capture the plate suffix (a/b/ab) if present. Valid prefixes: LH, MCLM, MCLM-LH, ADR (Las Hoyas); K-BUE, CER-BUE (Buenache). Null if not identifiable."
         },
         "campaign_year": {
             "type": "integer",
@@ -591,14 +609,48 @@ def _convert_node(node: dict) -> dict:
     return node
 
 
+def normalize_specimen_id(raw_id: str) -> Optional[str]:
+    """Normalize a raw specimen ID string to canonical format.
+
+    Canonical format: PREFIX-NUMBER[-plate]
+      - PREFIX in UPPERCASE (e.g. LH, MCLM, K-BUE)
+      - Hyphen separator
+      - NUMBER as-is (digits only)
+      - Optional hyphen + plate in lowercase (a, b, ab)
+
+    Returns None if the string is not a valid specimen ID (e.g. bare prefix
+    without a numeric part).
+    """
+    if not raw_id or not raw_id.strip():
+        return None
+
+    # Parse: prefix (alpha segments possibly joined by hyphens) + number + optional plate
+    m = re.match(
+        r"^\s*(?P<prefix>[A-Za-z]+(?:-[A-Za-z]+)*)[-\s_/]*(?P<number>\d{1,10})(?:[-\s_/]*(?P<plate>[aAbB]{1,2}))?\s*$",
+        raw_id.strip()
+    )
+    if not m:
+        return None  # Not parseable → reject (e.g. bare "LH")
+
+    prefix = m.group('prefix').upper()
+    number = m.group('number')
+    plate = m.group('plate').lower() if m.group('plate') else None
+
+    specimen_id = f"{prefix}-{number}"
+    if plate:
+        specimen_id += f"-{plate}"
+    return specimen_id
+
+
 def _normalize_extraction(extracted: dict, match: re.Match = None) -> dict:
     """Normalize extracted fields from a regex match to canonical specimen_id format.
 
     Rules:
-    - prefix: leave as extracted
+    - prefix: UPPERCASE
     - numeric part: leave as extracted
     - separators: always use '-'
     - plate: always lowercase
+    - Bare prefixes without a number are rejected (specimen_id set to None).
     """
     res = dict(extracted or {})
 
@@ -609,21 +661,23 @@ def _normalize_extraction(extracted: dict, match: re.Match = None) -> dict:
     specimen_raw = res.get('specimen_id')
     # Try to parse specimen_id if present
     if specimen_raw:
-        # NOTE: prefix must be alpha-only (with hyphens between alpha segments)
-        # to avoid greedily consuming digits from the numeric part.
-        # E.g. "LH-15324" must parse as prefix=LH, number=15324
-        #       not prefix=LH-1532, number=4.
-        m = re.match(r"^\s*(?P<prefix>[A-Za-z]+(?:-[A-Za-z]+)*)[-\s_/]*(?P<number>\d{1,10})(?:[-\s_/]*(?P<plate>[A-Za-z]{1,2}))?\s*$",
-                     specimen_raw)
-        if m:
-            prefix = m.group('prefix')
-            number = m.group('number')
-            plate = m.group('plate').lower() if m.group('plate') else None
-            specimen_id = f"{prefix}-{number}" + (f"-{plate}" if plate else "")
-            res['specimen_id'] = specimen_id
-            res['prefix'] = prefix
-            res['number'] = number
-            res['plate'] = plate
+        normalized = normalize_specimen_id(specimen_raw)
+        if normalized:
+            # Re-parse to extract components
+            m = re.match(
+                r"^(?P<prefix>[A-Z]+(?:-[A-Z]+)*)-(?P<number>\d+)(?:-(?P<plate>[a-z]{1,2}))?$",
+                normalized
+            )
+            if m:
+                res['specimen_id'] = normalized
+                res['prefix'] = m.group('prefix')
+                res['number'] = m.group('number')
+                res['plate'] = m.group('plate')
+                return res
+        else:
+            # Bare prefix or unparseable → clear it
+            logger.debug(f"Rejected invalid specimen_id from LLM: '{specimen_raw}'")
+            res['specimen_id'] = None
             return res
 
     # If specimen_id was not present or parsing failed, try to assemble from components
@@ -633,11 +687,16 @@ def _normalize_extraction(extracted: dict, match: re.Match = None) -> dict:
         plate = res.get('plate') or res.get('p') or None
         if plate:
             plate = plate.lower()
+        prefix = prefix.upper()
         specimen_id = f"{prefix}-{number}" + (f"-{plate}" if plate else "")
         res['specimen_id'] = specimen_id
         res['prefix'] = prefix
         res['number'] = number
         res['plate'] = plate
+    elif prefix and not number:
+        # Bare prefix without number → not a valid specimen ID
+        logger.debug(f"Rejected bare prefix without number: '{prefix}'")
+        res.pop('specimen_id', None)
 
     return res
 
@@ -728,12 +787,19 @@ Remember to convert Spanish taxonomic terms to scientific names."""
             if cy is None:
                 logger.debug(f"Path analysis did not include campaign_year. Raw response: {response_text[:1000]}")
 
+            # Normalize specimen_id: enforce PREFIX-NUMBER[-plate] format,
+            # reject bare prefixes like "LH" without a number.
+            raw_sid = data.get('specimen_id')
+            normalized_sid = normalize_specimen_id(raw_sid) if raw_sid else None
+            if raw_sid and not normalized_sid:
+                logger.debug(f"Path analysis rejected invalid specimen_id '{raw_sid}' for {directory_path}")
+
             return PathAnalysis(
                 macroclass=data.get('macroclass'),
                 taxonomic_class=data.get('taxonomic_class'),
                 genus=data.get('genus'),
                 campaign_year=cy,
-                specimen_id=data.get('specimen_id'),
+                specimen_id=normalized_sid,
                 collection_code=data.get('collection_code', 'LH'),
                 directory_path=str(directory_path),
                 confidence=float(data.get('confidence', 0)),
@@ -916,9 +982,16 @@ Extract any specimen ID, year, or taxonomic information encoded in the filename.
             response_text = self._call_api(get_file_analysis_prompt(), user_prompt, schema_name='file_analysis')
             data = self._parse_json(response_text)
             
+            # Normalize specimen_id: enforce PREFIX-NUMBER[-plate] format,
+            # reject bare prefixes like "LH" without a number.
+            raw_sid = data.get('specimen_id')
+            normalized_sid = normalize_specimen_id(raw_sid) if raw_sid else None
+            if raw_sid and not normalized_sid:
+                logger.debug(f"Per-file fallback rejected invalid specimen_id '{raw_sid}' for {filename}")
+
             return FileAnalysis(
                 filename=filename,
-                specimen_id=data.get('specimen_id'),
+                specimen_id=normalized_sid,
                 campaign_year=data.get('campaign_year'),
                 taxonomic_class=data.get('taxonomic_class'),
                 genus=data.get('genus'),

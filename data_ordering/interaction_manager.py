@@ -164,18 +164,21 @@ class InteractionManager:
         print(f"File: {request.file_path}")
         print(f"\n{request.message}")
         
-        is_dup_meta = (request.decision_type == DecisionType.DUPLICATE_METADATA_DISCREPANCY)
-        # Support the "apply to subdirectory" shortcut for a few decision
-        # types where the same choice makes sense across many files.
+        # Support the "apply to subdirectory / group" shortcut for decision
+        # types where the same choice makes sense across many items.
         supports_subdir = (request.decision_type in (
             DecisionType.SOURCE_DISCREPANCY,
             DecisionType.CAMERA_NUMBER_FLAG,
+            DecisionType.DUPLICATE_METADATA_DISCREPANCY,
             DecisionType.MERGE_FILE_COLLISION,
             DecisionType.MERGE_REGISTRY_CONFLICT,
         ))
         
-        # Show context only for non-table decision types (table is already in the message)
-        if request.context and not is_dup_meta:
+        # Show context (skip if the message already contains a value table)
+        has_inline_table = (request.decision_type in (
+            DecisionType.DUPLICATE_METADATA_DISCREPANCY,
+        ))
+        if request.context and not has_inline_table:
             print("\nContext:")
             for key, value in request.context.items():
                 # Skip internal keys used by the reconciliation engine
@@ -185,21 +188,18 @@ class InteractionManager:
         
         print("\nOptions:")
         for i, option in enumerate(request.options):
-            print(f"  [{i}] {option}")
+            print(f"  [{i + 1}] {option}")
         
         print(f"  [d] Defer to manual review folder")
-        if not is_dup_meta:
-            print(f"  [s] Skip this file")
-            print(f"  [c] Enter custom value")
+        print(f"  [s] Skip this file")
+        print(f"  [c] Enter custom value")
         if supports_subdir:
-            print(f"  [a] Apply chosen option to ALL files in this subdirectory (same field & sources)")
+            print(f"  [a] Apply chosen option to ALL files in this group/subdirectory")
         
-        if is_dup_meta:
-            valid_keys = f"0-{len(request.options)-1}, d"
-        elif supports_subdir:
-            valid_keys = f"0-{len(request.options)-1}, d, s, c, a"
+        if supports_subdir:
+            valid_keys = f"1-{len(request.options)}, d, s, c, a"
         else:
-            valid_keys = f"0-{len(request.options)-1}, d, s, c"
+            valid_keys = f"1-{len(request.options)}, d, s, c"
         
         while True:
             try:
@@ -211,13 +211,13 @@ class InteractionManager:
                 elif choice == 'd':
                     self.deferred_items.append(request)
                     return DecisionResult(outcome=DecisionOutcome.DEFER)
-                elif choice == 's' and not is_dup_meta:
+                elif choice == 's':
                     return DecisionResult(outcome=DecisionOutcome.SKIP)
-                elif choice == 'c' and not is_dup_meta:
+                elif choice == 'c':
                     custom = input("Enter custom value: ").strip()
                     subdir_too = False
                     if supports_subdir:
-                        subdir_choice = input("Apply this custom value to the whole subdirectory? [y/N]: ").strip().lower()
+                        subdir_choice = input("Apply this custom value to the whole group/subdirectory? [y/N]: ").strip().lower()
                         subdir_too = subdir_choice in ('y', 'yes')
                     return DecisionResult(
                         outcome=DecisionOutcome.APPLY_TO_SUBDIRECTORY if subdir_too else DecisionOutcome.CUSTOM,
@@ -225,9 +225,9 @@ class InteractionManager:
                     )
                 elif choice == 'a' and supports_subdir:
                     # Ask which numbered option to apply to the whole subdirectory
-                    sub_choice = input(f"  Which option to apply to the whole subdirectory? [0-{len(request.options)-1}]: ").strip()
+                    sub_choice = input(f"  Which option to apply to the whole subdirectory? [1-{len(request.options)}]: ").strip()
                     if sub_choice.isdigit():
-                        idx = int(sub_choice)
+                        idx = int(sub_choice) - 1  # Convert 1-based input to 0-based index
                         if 0 <= idx < len(request.options):
                             return DecisionResult(
                                 outcome=DecisionOutcome.APPLY_TO_SUBDIRECTORY,
@@ -236,12 +236,8 @@ class InteractionManager:
                     print("Invalid sub-option. Try again.")
                     continue
                 elif choice.isdigit():
-                    idx = int(choice)
+                    idx = int(choice) - 1  # Convert 1-based input to 0-based index
                     if 0 <= idx < len(request.options):
-                        # For dup-metadata, the last numbered option is
-                        # "Enter custom value per field" — handle inline.
-                        if is_dup_meta and idx == len(request.options) - 1:
-                            return self._prompt_custom_per_field(request)
                         return DecisionResult(
                             outcome=DecisionOutcome.ACCEPT,
                             selected_option=idx,
@@ -254,34 +250,6 @@ class InteractionManager:
                 print("\nInterrupted. Deferring this item.")
                 self.deferred_items.append(request)
                 return DecisionResult(outcome=DecisionOutcome.DEFER)
-    
-    def _prompt_custom_per_field(self, request: DecisionRequest) -> DecisionResult:
-        """Sub-prompt for entering a custom value per discrepant field.
-        
-        Shows each discrepant field with its current values across files,
-        then asks the user to type the desired value.
-        """
-        discrepancies = request.context.get('discrepancies', {})
-        file_paths = request.context.get('file_paths', [])
-        file_names = [Path(fp).name for fp in file_paths]
-        
-        print("\n--- Enter custom value for each field ---")
-        custom_values = {}
-        for field_name, entries in discrepancies.items():
-            values_display = ", ".join(
-                f"[{i}] {file_names[i]}={val}" for i, (_, val) in enumerate(entries)
-            )
-            print(f"\n  {field_name}: {values_display}")
-            val = input(f"  Enter value for '{field_name}': ").strip()
-            if val:
-                custom_values[field_name] = val
-        
-        # Encode as "field=value; field2=value2" for the orchestrator
-        custom_str = "; ".join(f"{k}={v}" for k, v in custom_values.items())
-        return DecisionResult(
-            outcome=DecisionOutcome.CUSTOM,
-            custom_value=custom_str,
-        )
     
     def _deferred_decision(self, request: DecisionRequest) -> DecisionResult:
         """Automatically defer to review folder."""
@@ -540,78 +508,51 @@ def create_duplicate_metadata_decision(
     discrepancies: Dict[str, List],
 ) -> DecisionRequest:
     """Create a decision request for duplicates with differing metadata.
-    
+
+    Uses the same per-value style as source-discrepancy decisions: each
+    distinct value is shown with its source file(s), and the user picks
+    which value to keep.  Supports [s] skip, [c] custom, [d] defer,
+    and [a] apply to whole duplicate group.
+
     Args:
         file_paths: All files in the duplicate group
         discrepancies: Dict mapping field_name -> list of (file_path, value) pairs
     """
-    # --- Build a comparison table ---
     file_names = [Path(fp).name for fp in file_paths]
     field_names = list(discrepancies.keys())
-    
-    # Build a value lookup:  field -> {file_path_str -> value}
+
+    # Build per-file value lookup:  field -> {file_path_str -> value}
     value_map: Dict[str, Dict[str, str]] = {}
     for field_name, entries in discrepancies.items():
         value_map[field_name] = {}
         for fpath_str, val in entries:
             value_map[field_name][str(fpath_str)] = val
-    
-    # Determine column widths for the table
-    field_header = "Field"
-    col_width_field = max(len(field_header), *(len(f) for f in field_names))
-    
-    col_widths = []
-    for i, fp in enumerate(file_paths):
-        fname = file_names[i]
-        header_label = f"[{i}] {fname}"
-        max_val_len = 0
-        for field_name in field_names:
-            val = value_map[field_name].get(str(fp), "(empty)")
-            max_val_len = max(max_val_len, len(val))
-        col_widths.append(max(len(header_label), max_val_len))
-    
-    # Build the table
-    sep = "─"
+
+    # Build a readable value table (same style as source_discrepancy)
     lines = []
-    
-    # Header
-    header_parts = [f" {field_header:<{col_width_field}} "]
-    for i, fp in enumerate(file_paths):
-        header_label = f"[{i}] {file_names[i]}"
-        header_parts.append(f" {header_label:<{col_widths[i]}} ")
-    
-    divider_parts = [sep * (col_width_field + 2)]
-    for w in col_widths:
-        divider_parts.append(sep * (w + 2))
-    
-    lines.append("┌" + "┬".join(divider_parts) + "┐")
-    lines.append("│" + "│".join(header_parts) + "│")
-    lines.append("├" + "┼".join(divider_parts) + "┤")
-    
-    # Data rows — one per discrepant field
     for field_name in field_names:
-        row_parts = [f" {field_name:<{col_width_field}} "]
+        lines.append(f"  {field_name}:")
         for i, fp in enumerate(file_paths):
             val = value_map[field_name].get(str(fp), "(empty)")
-            row_parts.append(f" {val:<{col_widths[i]}} ")
-        lines.append("│" + "│".join(row_parts) + "│")
-    
-    lines.append("└" + "┴".join(divider_parts) + "┘")
-    table_text = "\n".join(lines)
-    
-    # Build options: one per file (use that file's metadata) + custom
+            lines.append(f"    [{i + 1}] {file_names[i]}: {val}")
+    value_table = "\n".join(lines)
+
+    # Build options: one per file + leave empty + custom
     options = []
     for i, fpath in enumerate(file_paths):
-        options.append(f"Use metadata from [{i}]: {Path(fpath).name}")
-    options.append("Enter custom value for each discrepant field")
-    
+        options.append(f"Use metadata from [{i + 1}]: {file_names[i]}")
+    options.append("Leave discrepant fields empty")
+    options.append("Enter a custom value")
+
     return DecisionRequest(
         decision_type=DecisionType.DUPLICATE_METADATA_DISCREPANCY,
         file_path=file_paths[0],  # Primary file
         message=(
             f"Duplicate group ({len(file_paths)} files) has metadata discrepancies\n"
             f"Discrepant fields: {', '.join(field_names)}\n\n"
-            f"{table_text}"
+            f"{value_table}\n\n"
+            f"Choose which file's values to keep, or press [a] to apply the same "
+            f"choice to every duplicate group with the same discrepant fields."
         ),
         context={
             'file_paths': [str(p) for p in file_paths],
@@ -619,6 +560,8 @@ def create_duplicate_metadata_decision(
                 k: [(str(p), v) for p, v in vals]
                 for k, vals in discrepancies.items()
             },
+            # internal keys prefixed with _ are hidden in the CLI context display
+            '_field_names': field_names,
         },
         options=options,
         default_option=0,  # Default to first file (the "original")

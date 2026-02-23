@@ -255,13 +255,16 @@ class PipelineOrchestrator:
         Compute the staging directory name: <output_dir>_<source_dir_name>.
         
         If multiple source dirs, joins their names with '_'.
+        If the computed directory already exists (e.g. "Fotos 2009" vs "Fotos_2009"
+        both sanitize to the same name), a numeric suffix (_2, _3, …) is appended
+        to avoid collisions with previous runs.
         
         Args:
             output_dir: The final output directory
             source_dirs: List of source directories being processed
             
         Returns:
-            Path to the staging directory
+            Path to the staging directory (guaranteed not to already exist)
         """
         if not source_dirs:
             return output_dir / "_staging"
@@ -278,7 +281,24 @@ class PipelineOrchestrator:
         
         suffix = '_'.join(source_names) if source_names else 'unknown'
         staging_name = f"{output_dir.name}_{suffix}"
-        return output_dir.parent / staging_name
+        candidate = output_dir.parent / staging_name
+
+        # If the directory already exists, append an incrementing numeric suffix
+        # to avoid collisions (e.g. "Fotos 2009" and "Fotos_2009" both sanitize
+        # to the same name).
+        if candidate.exists():
+            counter = 2
+            while True:
+                candidate = output_dir.parent / f"{staging_name}_{counter}"
+                if not candidate.exists():
+                    break
+                counter += 1
+            logger.warning(
+                f"Staging directory name collision detected: '{staging_name}' already exists. "
+                f"Using '{candidate.name}' instead."
+            )
+
+        return candidate
 
     def __init__(
         self,
@@ -1776,9 +1796,15 @@ class PipelineOrchestrator:
                 # Build a summary of discrepant fields for review_reason
                 disc_fields_str = ', '.join(discrepancies.keys())
                 
+                # The new option layout is:
+                #   [0..N-1]  Use metadata from file [i]
+                #   [N]       Leave discrepant fields empty
+                #   [N+1]     Enter a custom value
+                n_files = len(group_file_strs)
+                
                 # Apply resolution
-                if result.outcome == DecisionOutcome.ACCEPT and result.selected_option is not None:
-                    if result.selected_option < len(group_file_strs):
+                if result.outcome in (DecisionOutcome.ACCEPT, DecisionOutcome.APPLY_TO_SUBDIRECTORY) and result.selected_option is not None:
+                    if result.selected_option < n_files:
                         # Use metadata from the chosen file — apply ONLY to the
                         # original (kept) file.  Duplicate files keep their own
                         # metadata so the registry preserves both sets of info.
@@ -1791,7 +1817,11 @@ class PipelineOrchestrator:
                             f"Resolved duplicate metadata: using values from "
                             f"{Path(chosen_path).name} (applied to original only)"
                         )
-                    # else: last option = custom, handled below
+                    elif result.selected_option == n_files:
+                        # "Leave discrepant fields empty"
+                        for field_name in discrepancies:
+                            self.state.processed_files[original_path][field_name] = None
+                        logger.info("Resolved duplicate metadata: cleared discrepant fields")
                 
                 if result.outcome == DecisionOutcome.CUSTOM and result.custom_value:
                     # Parse custom values — expect "field=value" pairs
@@ -1805,9 +1835,14 @@ class PipelineOrchestrator:
                                 self.state.processed_files[original_path][key] = val
                     logger.info("Resolved duplicate metadata with custom values (applied to original only)")
                 
+                if result.outcome == DecisionOutcome.SKIP:
+                    # Skip = leave as-is, don't modify metadata
+                    logger.info("Duplicate metadata discrepancy skipped — keeping values as-is")
+                
                 # Routing depends on the user's decision:
-                # - ACCEPT / CUSTOM: user actively resolved → duplicates go
-                #   to Duplicados (normal flow).  No needs_review flag.
+                # - ACCEPT / CUSTOM / SKIP / APPLY_TO_SUBDIRECTORY: user
+                #   actively resolved → duplicates go to Duplicados (normal
+                #   flow).  No needs_review flag.
                 # - DEFER: user deferred → ALL files in the group go to
                 #   Revision_Manual so the user can decide later.
                 if result.outcome == DecisionOutcome.DEFER:
