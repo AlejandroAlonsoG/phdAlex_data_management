@@ -89,84 +89,8 @@ Examples:
             base_checker = DataOrderingChecker(sources[0] if sources else merged)
             result = base_checker.check_merge_sources(sources, merged)
 
-            # Print a concise merge report
-            print('\n' + '='*70)
-            print('MERGE VALIDATION REPORT')
-            print('='*70)
-            print(f"  Sources analyzed: {len(result.get('sources', {}))}")
-            print(f"  Source unique hashes (union): {result.get('source_unique_hashes_count')}")
-            print(f"  Merged hashes: {result.get('merged_hashes_count')}")
-            print(f"  Merged duplicate registry entries: {result.get('merged_duplicate_count')}")
-
-            # Print comparison table header
-            print('\n  Source comparison:')
-            print('  ' + '-'*86)
-            hdr = f"  {'Source':30} | {'Main':>6} | {'Duplicates':>9} | {'Text':>6} | {'Other':>6} | {'TotalReg':>8} | {'Hashes':>6}"
-            print(hdr)
-            print('  ' + '-'*86)
-
-            # Print each source row
-            for src, info in result.get('sources', {}).items():
-                main_c = info.get('main_registry_count', 0)
-                dup_c = info.get('duplicate_registry_count', 0)
-                txt_c = info.get('text_registry_count', 0)
-                oth_c = info.get('other_registry_count', 0)
-                total_reg = main_c + dup_c + txt_c + oth_c
-                hashes_c = info.get('hashes_count') if info.get('hashes_count') is not None else ''
-                print(f"  {src:30.30} | {main_c:6d} | {dup_c:9d} | {txt_c:6d} | {oth_c:6d} | {total_reg:8d} | {str(hashes_c):>6}")
-
-            print('  ' + '-'*86)
-
-            # Print merged summary row
-            ms = result.get('merged_summary', {})
-            mm = ms.get('main_registry_count', 0)
-            md = ms.get('duplicate_registry_count', 0)
-            mt = ms.get('text_registry_count', 0)
-            mo = ms.get('other_registry_count', 0)
-            mtotal = mm + md + mt + mo
-            mh = ms.get('hashes_count') if ms.get('hashes_count') is not None else ''
-            print(f"  {'MERGED':30} | {mm:6d} | {md:9d} | {mt:6d} | {mo:6d} | {mtotal:8d} | {str(mh):>6}")
-            print('  ' + '-'*86)
-
-            # Print totals comparison (sources sum vs merged)
-            sources_totals = result.get('sources_totals', {})
-            comparison = result.get('merge_totals_comparison', {})
-            if sources_totals and comparison:
-                print('\n  Totals comparison:')
-                print(f"    Sources (main+duplicates): {sources_totals.get('sum_main_plus_duplicates', 0)}")
-                print(f"    Merged  (main+duplicates): {comparison.get('merged_main_plus_duplicates', 0)}")
-                eq = comparison.get('equal_totals')
-                eq_s = 'YES' if eq else 'NO'
-                print(f"    Totals equal?: {eq_s}")
-                collisions = comparison.get('collisions_main_minus_sources_main')
-                print(f"    Collisions ( sum(sources main)): {collisions:+d}")
-
-            missing = result.get('missing_in_merged', [])
-            new = result.get('new_in_merged', [])
-            print(f"\n  Missing in merged: {len(missing)}")
-            if len(missing) > 0:
-                for h in missing[:10]:
-                    print(f"    - {h}")
-                if len(missing) > 10:
-                    print(f"    ... and {len(missing)-10} more")
-
-            print(f"  New in merged: {len(new)}")
-            if len(new) > 0:
-                for h in new[:10]:
-                    print(f"    - {h}")
-                if len(new) > 10:
-                    print(f"    ... and {len(new)-10} more")
-
-            # Internal merged coherence
-            if 'merged_internal' in result:
-                mi = result['merged_internal']
-                print('\n  Merged internal coherence:')
-                print(f"    Files (structure): {mi['file_structure']['total']}")
-                print(f"    Files (registries): {mi['registries']['total']}")
-                print(f"    Non-dup diff: {mi['discrepancies']['non_duplicate_images_diff']}")
-                print(f"    Dup diff:     {mi['discrepancies']['duplicate_images_diff']}")
-
-            print('\n' + '='*70 + '\n')
+            if not args.quiet:
+                DataOrderingChecker.print_merge_report(result)
 
             # Export merge result if requested
             if args.json:

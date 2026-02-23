@@ -250,6 +250,79 @@ class DataOrderingChecker:
         
         return metrics
     
+    def check_hash_integrity(self) -> Dict[str, Any]:
+        """
+        Validate hash registry integrity against annotations.
+        
+        Checks:
+        1. Hash count == Annotation count
+        2. All UUIDs in annotations exist in hashes (and vice versa)
+        3. No duplicate-flagged UUIDs appear in hash registry
+        
+        Returns:
+            Dictionary with validation results
+        """
+        result = {
+            'hash_count': 0,
+            'annotation_count': 0,
+            'counts_match': False,
+            'annotation_uuids_missing_from_hashes': [],
+            'hash_uuids_missing_from_annotations': [],
+            'duplicate_uuids_in_hashes': [],
+            'all_checks_passed': False,
+        }
+        
+        # Get UUID sets from annotations
+        annotation_uuids = set()
+        if self.main_df is not None and 'uuid' in self.main_df.columns:
+            annotation_uuids = set(
+                self.main_df['uuid'].dropna().astype(str).str.strip()
+            )
+        result['annotation_count'] = len(annotation_uuids)
+        
+        # Get UUID sets from hashes
+        hash_uuids = set()
+        if self.hash_df is not None and 'uuid' in self.hash_df.columns:
+            hash_uuids = set(
+                self.hash_df['uuid'].dropna().astype(str).str.strip()
+            )
+        result['hash_count'] = len(hash_uuids)
+        
+        # Get UUID sets from duplicates
+        duplicate_uuids = set()
+        if self.duplicate_df is not None and 'uuid' in self.duplicate_df.columns:
+            duplicate_uuids = set(
+                self.duplicate_df['uuid'].dropna().astype(str).str.strip()
+            )
+        
+        # Check 1: counts match
+        result['counts_match'] = (
+            result['hash_count'] == result['annotation_count']
+        )
+        
+        # Check 2: UUID cross-reference
+        result['annotation_uuids_missing_from_hashes'] = sorted(
+            annotation_uuids - hash_uuids
+        )
+        result['hash_uuids_missing_from_annotations'] = sorted(
+            hash_uuids - annotation_uuids
+        )
+        
+        # Check 3: No duplicate UUIDs in hash registry
+        result['duplicate_uuids_in_hashes'] = sorted(
+            duplicate_uuids & hash_uuids
+        )
+        
+        # Overall pass/fail
+        result['all_checks_passed'] = (
+            result['counts_match']
+            and len(result['annotation_uuids_missing_from_hashes']) == 0
+            and len(result['hash_uuids_missing_from_annotations']) == 0
+            and len(result['duplicate_uuids_in_hashes']) == 0
+        )
+        
+        return result
+    
     def get_taxonomy_info(self) -> TaxonomyMetrics:
         """
         Extract all unique macroclasses, classes, and determinations from ALL registries.
@@ -317,11 +390,13 @@ class DataOrderingChecker:
         }
         
         tax_dict = taxonomy_metrics.to_dict()
+        hash_integrity = self.check_hash_integrity()
 
         return {
             'file_structure_counts': file_structure_metrics.to_dict(),
             'registry_counts': registry_metrics.to_dict(),
             'discrepancies': discrepancies,
+            'hash_integrity': hash_integrity,
             'taxonomy': tax_dict,
             'summary': {
                 'total_files_structure': file_structure_metrics.total(),
@@ -333,78 +408,259 @@ class DataOrderingChecker:
         }
     
     def print_report(self):
-        """Print a formatted report to console."""
+        """Print a focused validation report to console."""
         report = self.get_detailed_report()
         
         print("\n" + "="*70)
-        print("DATA ORDERING CHECKER - VERIFICATION REPORT")
+        print("DATA ORDERING CHECKER -- VERIFICATION REPORT")
+        print("="*70)
+        print(f"  Directory: {self.output_dir}")
+        
+        # Registry counts
+        reg = report['registry_counts']
+        hi = report['hash_integrity']
+        print("\n  REGISTRY COUNTS:")
+        print("  " + "-" * 50)
+        print(f"    Annotations (non-dup images): {reg['non_duplicate_images']}")
+        print(f"    Duplicate images:             {reg['duplicate_images']}")
+        print(f"    Text files:                   {reg['text_files']}")
+        print(f"    Other files:                  {reg['other_files']}")
+        print(f"    Hashes:                       {hi['hash_count']}")
+        
+        # File system counts
+        fs = report['file_structure_counts']
+        print("\n  FILE SYSTEM COUNTS:")
+        print("  " + "-" * 50)
+        print(f"    Non-duplicate images: {fs['non_duplicate_images']}")
+        print(f"    Duplicate images:     {fs['duplicate_images']}")
+        print(f"    Text files:           {fs['text_files']}")
+        print(f"    Other files:          {fs['other_files']}")
+        
+        # Validation checks
+        print("\n  VALIDATION CHECKS:")
+        print("  " + "-" * 50)
+        
+        disc = report['discrepancies']
+        all_ok = True
+        
+        check_items = [
+            ('Non-dup images', disc['non_duplicate_images_diff']),
+            ('Duplicate images', disc['duplicate_images_diff']),
+            ('Text files', disc['text_files_diff']),
+            ('Other files', disc['other_files_diff']),
+        ]
+        for label, diff in check_items:
+            if diff == 0:
+                print(f"    [OK]   {label}: registry matches filesystem")
+            else:
+                print(f"    [FAIL] {label}: MISMATCH (diff={diff:+d})")
+                all_ok = False
+        
+        if hi['counts_match']:
+            print(f"    [OK]   Hash count == annotation count ({hi['hash_count']})")
+        else:
+            print(f"    [FAIL] Hash count ({hi['hash_count']}) != annotation count ({hi['annotation_count']})")
+            all_ok = False
+        
+        n_missing = len(hi['annotation_uuids_missing_from_hashes'])
+        if n_missing == 0:
+            print("    [OK]   All annotation UUIDs found in hashes")
+        else:
+            print(f"    [FAIL] {n_missing} annotation UUID(s) missing from hashes")
+            for uid in hi['annotation_uuids_missing_from_hashes'][:5]:
+                print(f"             - {uid}")
+            if n_missing > 5:
+                print(f"             ... and {n_missing - 5} more")
+            all_ok = False
+        
+        n_extra = len(hi['hash_uuids_missing_from_annotations'])
+        if n_extra == 0:
+            print("    [OK]   All hash UUIDs found in annotations")
+        else:
+            print(f"    [FAIL] {n_extra} hash UUID(s) not in annotations")
+            for uid in hi['hash_uuids_missing_from_annotations'][:5]:
+                print(f"             - {uid}")
+            if n_extra > 5:
+                print(f"             ... and {n_extra - 5} more")
+            all_ok = False
+        
+        n_dup_leak = len(hi['duplicate_uuids_in_hashes'])
+        if n_dup_leak == 0:
+            print("    [OK]   No duplicate UUIDs in hash registry")
+        else:
+            print(f"    [FAIL] {n_dup_leak} duplicate UUID(s) leaked into hash registry")
+            for uid in hi['duplicate_uuids_in_hashes'][:5]:
+                print(f"             - {uid}")
+            if n_dup_leak > 5:
+                print(f"             ... and {n_dup_leak - 5} more")
+            all_ok = False
+        
+        print()
+        if all_ok:
+            print("  == ALL CHECKS PASSED ==")
+        else:
+            print("  == SOME CHECKS FAILED -- review above ==")
+        
+        print("\n" + "="*70 + "\n")
+    
+    @staticmethod
+    def _print_internal_checks(fs, reg, disc, hi, indent="  "):
+        """Print the internal coherence checks (shared between single-dir and merge reports)."""
+        all_ok = True
+        
+        print(f"\n{indent}REGISTRY COUNTS:")
+        print(f"{indent}" + "-" * 50)
+        print(f"{indent}  Annotations (non-dup images): {reg['non_duplicate_images']}")
+        print(f"{indent}  Duplicate images:             {reg['duplicate_images']}")
+        print(f"{indent}  Text files:                   {reg['text_files']}")
+        print(f"{indent}  Other files:                  {reg['other_files']}")
+        print(f"{indent}  Hashes:                       {hi.get('hash_count', '?')}")
+        
+        print(f"\n{indent}FILE SYSTEM COUNTS:")
+        print(f"{indent}" + "-" * 50)
+        print(f"{indent}  Non-duplicate images: {fs['non_duplicate_images']}")
+        print(f"{indent}  Duplicate images:     {fs['duplicate_images']}")
+        print(f"{indent}  Text files:           {fs['text_files']}")
+        print(f"{indent}  Other files:          {fs['other_files']}")
+        
+        print(f"\n{indent}VALIDATION CHECKS:")
+        print(f"{indent}" + "-" * 50)
+        
+        check_items = [
+            ('Non-dup images', disc.get('non_duplicate_images_diff', 0)),
+            ('Duplicate images', disc.get('duplicate_images_diff', 0)),
+        ]
+        for label, diff in check_items:
+            if diff is not None and diff == 0:
+                print(f"{indent}  [OK]   {label}: registry matches filesystem")
+            else:
+                print(f"{indent}  [FAIL] {label}: MISMATCH (diff={diff})")
+                all_ok = False
+        
+        if hi:
+            if hi.get('counts_match'):
+                print(f"{indent}  [OK]   Hash count == annotation count ({hi.get('hash_count', '?')})")
+            else:
+                print(f"{indent}  [FAIL] Hash count ({hi.get('hash_count')}) != annotation count ({hi.get('annotation_count')})")
+                all_ok = False
+            
+            n = len(hi.get('annotation_uuids_missing_from_hashes', []))
+            if n == 0:
+                print(f"{indent}  [OK]   All annotation UUIDs found in hashes")
+            else:
+                print(f"{indent}  [FAIL] {n} annotation UUID(s) missing from hashes")
+                all_ok = False
+            
+            n = len(hi.get('hash_uuids_missing_from_annotations', []))
+            if n == 0:
+                print(f"{indent}  [OK]   All hash UUIDs found in annotations")
+            else:
+                print(f"{indent}  [FAIL] {n} hash UUID(s) not in annotations")
+                all_ok = False
+            
+            n = len(hi.get('duplicate_uuids_in_hashes', []))
+            if n == 0:
+                print(f"{indent}  [OK]   No duplicate UUIDs in hash registry")
+            else:
+                print(f"{indent}  [FAIL] {n} duplicate UUID(s) leaked into hash registry")
+                all_ok = False
+        
+        return all_ok
+    
+    @staticmethod
+    def print_merge_report(result: Dict[str, Any]):
+        """Print a formatted merge validation report.
+        
+        Uses the same validation format as print_report() for the internal
+        coherence section, then adds merge-specific source comparison and
+        total-preservation checks.
+        
+        Args:
+            result: Dictionary returned by check_merge_sources()
+        """
+        print("\n" + "="*70)
+        print("DATA ORDERING CHECKER -- MERGE VALIDATION")
         print("="*70)
         
-        # File structure metrics
-        print("\n📁 FILE SYSTEM STRUCTURE COUNTS:")
-        print("-" * 50)
-        fs = report['file_structure_counts']
-        print(f"  Non-duplicate images: {fs['non_duplicate_images']}")
-        print(f"  Duplicate images:     {fs['duplicate_images']}")
-        print(f"  Text files:           {fs['text_files']}")
-        print(f"  Other files:          {fs['other_files']}")
-        print(f"  {'─' * 45}")
-        print(f"  TOTAL:                {fs['total']}")
+        all_ok = True
         
-        # Registry metrics
-        print("\n📊 EXCEL REGISTRIES COUNTS:")
-        print("-" * 50)
-        reg = report['registry_counts']
-        print(f"  Non-duplicate images: {reg['non_duplicate_images']}")
-        print(f"  Duplicate images:     {reg['duplicate_images']}")
-        print(f"  Text files:           {reg['text_files']}")
-        print(f"  Other files:          {reg['other_files']}")
-        print(f"  {'─' * 45}")
-        print(f"  TOTAL:                {reg['total']}")
+        # --- Internal coherence of merged directory ---
+        if 'merged_internal' in result:
+            mi = result['merged_internal']
+            fs = mi['file_structure']
+            reg = mi['registries']
+            disc = mi['discrepancies']
+            hi = mi.get('hash_integrity', {})
+            
+            print("\n--- Merged directory: internal coherence ---")
+            
+            internal_ok = DataOrderingChecker._print_internal_checks(
+                fs, reg, disc, hi, indent="  "
+            )
+            if not internal_ok:
+                all_ok = False
+        elif 'merged_internal_error' in result:
+            print(f"\n  [WARN] Could not check merged directory: {result['merged_internal_error']}")
+            all_ok = False
         
-        # Discrepancies
-        print("\n⚠️  DISCREPANCIES (Structure - Registry):")
-        print("-" * 50)
-        disc = report['discrepancies']
-        all_zero = all(v == 0 for v in disc.values())
-        if all_zero:
-            print("  ✓ No discrepancies found!")
+        # --- Source summary ---
+        sources = result.get('sources', {})
+        if sources:
+            print("\n--- Source directories ---\n")
+            hdr = f"  {'Source':<30} | {'Main':>6} | {'Dup':>6} | {'Text':>6} | {'Other':>6} | {'Hashes':>6}"
+            print(hdr)
+            print("  " + "-" * (len(hdr) - 2))
+            for src, info in sources.items():
+                name = Path(src).name[:30]
+                m = info.get('main_registry_count', 0)
+                d = info.get('duplicate_registry_count', 0)
+                t = info.get('text_registry_count', 0)
+                o = info.get('other_registry_count', 0)
+                h = info.get('hashes_count')
+                h_str = str(h) if h is not None else '?'
+                print(f"  {name:<30} | {m:6d} | {d:6d} | {t:6d} | {o:6d} | {h_str:>6}")
+            # Merged folder row
+            ms = result.get('merged_summary', {})
+            if ms:
+                print("  " + "-" * (len(hdr) - 2))
+                mm = ms.get('main_registry_count', 0)
+                md = ms.get('duplicate_registry_count', 0)
+                mt = ms.get('text_registry_count', 0)
+                mo = ms.get('other_registry_count', 0)
+                mh = ms.get('hashes_count')
+                mh_str = str(mh) if mh is not None else '?'
+                print(f"  {'MERGED':<30} | {mm:6d} | {md:6d} | {mt:6d} | {mo:6d} | {mh_str:>6}")
+        
+        # --- Merge-specific validation ---
+        comp = result.get('merge_totals_comparison', {})
+        if comp:
+            print("\n--- Merge validation ---\n")
+            
+            s_total = comp.get('sources_main_plus_duplicates', 0)
+            m_total = comp.get('merged_main_plus_duplicates', 0)
+            eq = comp.get('equal_totals', False)
+            
+            if eq:
+                print(f"  [OK]   Total images preserved: sources({s_total}) == merged({m_total})")
+            else:
+                print(f"  [FAIL] Total images MISMATCH: sources({s_total}) != merged({m_total})")
+                all_ok = False
+            
+            if comp.get('hashes_differ', False):
+                if comp.get('hash_difference_justified', True):
+                    print("  [OK]   Hash count differs but duplicates exist (justified)")
+                else:
+                    print("  [FAIL] Hash count differs but NO duplicates -- possible data loss")
+                    all_ok = False
+            else:
+                print("  [OK]   Hash counts consistent across sources and merged")
+        
+        # Overall
+        print()
+        if all_ok:
+            print("  == ALL CHECKS PASSED ==")
         else:
-            for key, value in disc.items():
-                status = "✓" if value == 0 else "✗"
-                print(f"  {status} {key}: {value:+d}")
-        
-        # Taxonomy
-        print("\n🔬 TAXONOMY INFORMATION:")
-        print("-" * 50)
-        tax = report['taxonomy']
-        print(f"\n  Macroclasses ({len(tax['macroclasses'])}):")
-        for mc in tax['macroclasses'][:10]:  # Show first 10
-            print(f"    • {mc}")
-        if len(tax['macroclasses']) > 10:
-            print(f"    ... and {len(tax['macroclasses']) - 10} more")
-        
-        print(f"\n  Classes ({len(tax['classes'])}):")
-        for c in tax['classes'][:10]:  # Show first 10
-            print(f"    • {c}")
-        if len(tax['classes']) > 10:
-            print(f"    ... and {len(tax['classes']) - 10} more")
-        
-        print(f"\n  Determinations/Genera ({len(tax['determinations'])}):")
-        for d in tax['determinations'][:10]:  # Show first 10
-            print(f"    • {d}")
-        if len(tax['determinations']) > 10:
-            print(f"    ... and {len(tax['determinations']) - 10} more")
-        
-        # Summary
-        print("\n📈 SUMMARY:")
-        print("-" * 50)
-        summary = report['summary']
-        print(f"  Total files (structure):  {summary['total_files_structure']}")
-        print(f"  Total files (registry):   {summary['total_files_registry']}")
-        print(f"  Unique macroclasses:      {summary['macroclasses_count']}")
-        print(f"  Unique classes:           {summary['classes_count']}")
-        print(f"  Unique determinations:    {summary['determinations_count']}")
+            print("  == SOME CHECKS FAILED -- review above ==")
         
         print("\n" + "="*70 + "\n")
     
@@ -580,12 +836,12 @@ class DataOrderingChecker:
             merged_checker = DataOrderingChecker(merged_dir)
             fs_metrics = merged_checker.count_files_in_structure()
             reg_metrics = merged_checker.count_files_in_registries()
-            taxonomy = merged_checker.get_taxonomy_info().to_dict()
+            hash_integrity = merged_checker.check_hash_integrity()
 
             result['merged_internal'] = {
                 'file_structure': fs_metrics.to_dict(),
                 'registries': reg_metrics.to_dict(),
-                'taxonomy': taxonomy,
+                'hash_integrity': hash_integrity,
                 'discrepancies': {
                     'non_duplicate_images_diff': fs_metrics.non_duplicate_images - reg_metrics.non_duplicate_images if reg_metrics.non_duplicate_images is not None else None,
                     'duplicate_images_diff': fs_metrics.duplicate_images - reg_metrics.duplicate_images if reg_metrics.duplicate_images is not None else None,
@@ -625,12 +881,23 @@ class DataOrderingChecker:
         # Compare merged main+duplicates with sum of sources
         merged_main = result['merged_summary']['main_registry_count']
         merged_dup = result['merged_summary']['duplicate_registry_count']
+
+        # Hash count validation: differences only acceptable if duplicates exist
+        sum_source_hashes = sum(
+            v.get('hashes_count', 0) or 0 for v in source_entries.values()
+        )
+        merged_hash_count = result['merged_summary'].get('hashes_count') or 0
+        hashes_differ = sum_source_hashes != merged_hash_count
+        has_merged_duplicates = merged_dup > 0
+
         result['merge_totals_comparison'] = {
             'merged_main_plus_duplicates': merged_main + merged_dup,
             'sources_main_plus_duplicates': result['sources_totals']['sum_main_plus_duplicates'],
             'equal_totals': (merged_main + merged_dup) == result['sources_totals']['sum_main_plus_duplicates'],
-            # collisions as defined: merged main images minus sum of source main images
-            'collisions_main_minus_sources_main': merged_main - result['sources_totals']['sum_main_registry_count'],
+            'sum_source_hashes': sum_source_hashes,
+            'merged_hashes': merged_hash_count,
+            'hashes_differ': hashes_differ,
+            'hash_difference_justified': not hashes_differ or has_merged_duplicates,
         }
 
         return result

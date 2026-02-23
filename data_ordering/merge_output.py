@@ -27,13 +27,14 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime
 
 import pandas as pd
 
 from .image_hasher import ImageHasher, DuplicateType
 from .config import IMAGE_EXTENSIONS
+from .main_orchestrator import PipelineOrchestrator
 from .interaction_manager import (
     InteractionManager, InteractionMode, DecisionType, DecisionOutcome,
     DecisionRequest, DecisionResult,
@@ -190,6 +191,9 @@ class OutputMerger:
         # Map copied staging duplicate -> final dest path in output (for registry updates)
         self._copied_duplicates: Dict[str, str] = {}
 
+        # UUIDs detected as duplicates during file merging (shared with registry merge)
+        self._file_level_duplicate_uuids: Set[str] = set()
+
         # Annotation registries (loaded lazily when needed for conflict UI)
         self._staging_anotaciones: Optional[pd.DataFrame] = None
         self._staging_duplicados: Optional[pd.DataFrame] = None
@@ -255,23 +259,6 @@ class OutputMerger:
         new_filename = f"{year_str}_{specimen_part}_{file_uuid}{ext}"
         return new_filename
 
-    def _copy_as_jpeg(self, source_path: Path, dest_path: Path) -> bool:
-        """Attempt to convert image to JPEG using Pillow; return True if converted."""
-        try:
-            from PIL import Image
-            with Image.open(source_path) as img:
-                if img.mode not in ('RGB', 'L'):
-                    img = img.convert('RGB')
-                elif img.mode == 'L':
-                    img = img.convert('RGB')
-                img.save(dest_path, format='JPEG')
-            stat = os.stat(source_path)
-            os.utime(dest_path, (stat.st_atime, stat.st_mtime))
-            return True
-        except Exception:
-            return False
-        return None, None
-    
     def _load_staging_info(self) -> Optional[Dict]:
         """Load staging_info.json from the staging directory."""
         info_path = self.staging_dir / "staging_info.json"
@@ -305,8 +292,9 @@ class OutputMerger:
                     fp = str(row.get('file_path', '')) if pd.notna(row.get('file_path')) else ''
                     md5 = str(row.get('md5_hash', '')) if pd.notna(row.get('md5_hash')) else ''
                     phash = str(row.get('phash', '')) if pd.notna(row.get('phash')) else ''
+                    uuid_val = str(row.get('uuid', '')) if pd.notna(row.get('uuid')) else ''
                     if fp:
-                        cache[fp] = {'md5_hash': md5, 'phash': phash}
+                        cache[fp] = {'md5_hash': md5, 'phash': phash, 'uuid': uuid_val}
                 setattr(self, target, cache)
                 logger.info(f"Loaded {len(cache)} hash entries from {label} hashes.xlsx")
                 print(f"  Loaded {len(cache)} pre-computed hashes from {label}")
@@ -392,6 +380,7 @@ class OutputMerger:
                     return {
                         'md5_hash': str(entry.get('md5_hash', '') or ''),
                         'phash': str(entry.get('phash', '') or ''),
+                        'uuid': str(entry.get('uuid', '') or ''),
                     }
         except ValueError:
             pass  # Not a relative path, that's fine
@@ -405,10 +394,103 @@ class OutputMerger:
                 return {
                     'md5_hash': str(entry.get('md5_hash', '') or ''),
                     'phash': str(entry.get('phash', '') or ''),
+                    'uuid': str(entry.get('uuid', '') or ''),
                 }
 
         # Not found in registry — return empty hashes
-        return {'md5_hash': '', 'phash': ''}
+        return {'md5_hash': '', 'phash': '', 'uuid': ''}
+
+    def _check_missing_hashes(self):
+        """Detect staging files that are missing from the hash registry.
+
+        Every mergeable file in the staging directory is checked against
+        ``self._staging_hashes``.  If any files lack pre-computed hashes
+        the user is prompted to either:
+
+        * **Compute** them on-the-fly (and any other missing ones).
+        * **Abort** the merge entirely.
+
+        In ``auto_accept`` mode, missing hashes are computed automatically.
+
+        Raises:
+            RuntimeError: If the user chooses to abort.
+        """
+        missing_files: List[Path] = []
+        for file_path in self.staging_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            rel_path = file_path.relative_to(self.staging_dir)
+            if self._should_skip_path(rel_path):
+                continue
+            # Files inside Duplicados/ are already-identified duplicates whose
+            # originals already have hashes.  They were never added to
+            # hashes.xlsx by the pipeline, so it's expected (and fine) that
+            # they have no entry — skip them from the missing-hash check.
+            if rel_path.parts and rel_path.parts[0].lower() == "duplicados":
+                continue
+            # Only images need hashes for duplicate detection
+            if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            h = self._get_file_hashes(file_path, 'staging')
+            if not h.get('md5_hash'):
+                missing_files.append(file_path)
+
+        if not missing_files:
+            return  # all good
+
+        print(f"\n  WARNING: {len(missing_files)} staging image(s) have no entry in hashes.xlsx.")
+        for f in missing_files[:10]:
+            print(f"    - {f.relative_to(self.staging_dir)}")
+        if len(missing_files) > 10:
+            print(f"    ... and {len(missing_files) - 10} more")
+
+        # Decide
+        auto = self.interaction_manager.mode in (
+            InteractionMode.AUTO_ACCEPT, InteractionMode.DEFERRED,
+        )
+        if auto:
+            choice = 1  # compute automatically
+            print("  Auto-mode: computing missing hashes on-the-fly.")
+        else:
+            print("\n  [1] Compute missing hashes on-the-fly and continue")
+            print("  [2] Abort merge")
+            raw = input("  Choice [1/2]: ").strip()
+            choice = 2 if raw == '2' else 1
+
+        if choice == 2:
+            raise RuntimeError(
+                f"Merge aborted by user: {len(missing_files)} staging file(s) "
+                f"missing from hashes.xlsx. Run the pipeline on the staging "
+                f"directory first to generate hashes."
+            )
+
+        # Compute hashes for every missing file
+        print(f"  Computing hashes for {len(missing_files)} file(s)...")
+        for i, file_path in enumerate(missing_files):
+            try:
+                img_hash = self.image_hasher.hash_image(file_path)
+                md5 = img_hash.md5_hash or ''
+                phash = str(img_hash.phash) if img_hash.phash else ''
+                entry = {'md5_hash': md5, 'phash': phash, 'uuid': ''}
+
+                # Insert into staging cache (both relative and absolute keys)
+                fp_abs = str(file_path)
+                self._staging_hashes[fp_abs] = entry
+                try:
+                    rel_key = file_path.relative_to(self.staging_dir).as_posix()
+                    self._staging_hashes[rel_key] = entry
+                except ValueError:
+                    pass
+
+                self.stats['hashes_computed'] += 1
+            except Exception as e:
+                logger.warning(f"Failed to hash {file_path}: {e}")
+                self.stats['errors'] += 1
+
+            if (i + 1) % 50 == 0 or (i + 1) == len(missing_files):
+                print(f"    Hashed {i + 1}/{len(missing_files)}")
+
+        print(f"  Done. Computed {self.stats['hashes_computed']} hashes.")
 
     def _should_skip_path(self, rel_path: Path) -> bool:
         """Check if a path should be skipped during file copy."""
@@ -481,6 +563,11 @@ class OutputMerger:
                 matched_path, dup_type = match
                 logger.info(f"Duplicate detected ({dup_type.value}): {rel_path} ↔ {matched_path}")
 
+                # Track UUID for cross-referencing with registry merge
+                s_uuid = s_hashes.get('uuid', '')
+                if s_uuid:
+                    self._file_level_duplicate_uuids.add(s_uuid)
+
                 # Copy duplicate into output/Duplicados (pipeline-like behavior)
                 dup_dir = self.output_dir / 'Duplicados'
                 if not self.dry_run:
@@ -507,7 +594,7 @@ class OutputMerger:
                         if staging_path.suffix.lower() in IMAGE_EXTENSIONS:
                             # prefer .jpg destination
                             jpg_dest = dest_path.with_suffix('.jpg')
-                            converted = self._copy_as_jpeg(staging_path, jpg_dest)
+                            converted = PipelineOrchestrator._copy_as_jpeg(staging_path, jpg_dest)
                             if converted:
                                 final_dest = jpg_dest
                             else:
@@ -741,8 +828,16 @@ class OutputMerger:
                     else:
                         extra_message = '(no registry data found)'
 
-                # Determine subdirectory key (relative path inside staging)
-                subdir_key = str(rel_path.parent)
+                # Determine subdirectory key from original_path in annotations
+                # (parsing ';'-separated values written by the orchestrator)
+                subdir_key = ''
+                s_orig_path = s_row.get('original_path', '') if s_row else ''
+                o_orig_path = o_row.get('original_path', '') if o_row else ''
+                orig_for_key = str(s_orig_path or o_orig_path or '')
+                if orig_for_key:
+                    subdir_key = self._extract_subdir_key(orig_for_key)
+                if not subdir_key:
+                    subdir_key = str(rel_path.parent)  # fallback to current dir
 
                 # If user has already chosen an "apply to subdirectory" action,
                 # use it without prompting again.
@@ -823,8 +918,8 @@ class OutputMerger:
 
         The *anotaciones* and *hashes* registries are merged together in a
         single cross-referenced pass: for each staging image we look for a
-        match by hash **or** specimen-id in the output, then reconcile the
-        annotation fields.
+        match by hash (pHash first, then MD5) in the output, then reconcile
+        the annotation fields.
 
         The remaining registries (archivos_texto, archivos_otros,
         duplicados_registro) are merged independently by original_path.
@@ -943,6 +1038,24 @@ class OutputMerger:
                         parts.append(p)
         return '; '.join(parts)
 
+    @staticmethod
+    def _extract_subdir_key(original_path_str: str) -> str:
+        """Extract a subdirectory key from an original_path value.
+
+        The original_path may contain multiple ';'-separated paths
+        (as written by the main orchestrator when duplicates merge).
+        Returns the parent directory of the FIRST path.
+        """
+        if not original_path_str:
+            return ''
+        paths = [p.strip() for p in original_path_str.split(';') if p.strip()]
+        if not paths:
+            return ''
+        try:
+            return str(Path(paths[0]).parent)
+        except Exception:
+            return ''
+
     # ------------------------------------------------------------------
     # Unified cross-referenced merge (annotations + hashes)
     # ------------------------------------------------------------------
@@ -952,200 +1065,244 @@ class OutputMerger:
         staging_reg_dir: Path,
         output_reg_dir: Path,
     ):
-        """Merge anotaciones.xlsx and hashes.xlsx together.
+        """Merge anotaciones.xlsx and hashes.xlsx together, handling duplicates and conflicts as described."""
+        import pandas as pd
+        from collections import defaultdict
 
-        For each staging hash record, this method looks for a match in the
-        output hash registry. The matching logic is:
-        1. Perceptual hash (pHash) exact match.
-        2. MD5 hash exact match (as fallback if pHash is missing on either side).
-
-        The link between the hashes and annotations registries is the 'uuid' column.
-        When a match is found, annotation fields are compared and conflicts
-        are presented to the user.
-        """
         staging_ann_path = staging_reg_dir / "anotaciones.xlsx"
         staging_hash_path = staging_reg_dir / "hashes.xlsx"
         output_ann_path = output_reg_dir / "anotaciones.xlsx"
         output_hash_path = output_reg_dir / "hashes.xlsx"
+        output_dup_reg_path = self.output_dir / "Duplicados" / "duplicados_registro.xlsx"
 
-        # --- Load staging data ---
+        # Load data
         s_ann = pd.read_excel(staging_ann_path) if staging_ann_path.exists() else pd.DataFrame()
         s_hash = pd.read_excel(staging_hash_path) if staging_hash_path.exists() else pd.DataFrame()
+        o_ann = pd.read_excel(output_ann_path) if output_ann_path.exists() else pd.DataFrame()
+        o_hash = pd.read_excel(output_hash_path) if output_hash_path.exists() else pd.DataFrame()
+        o_dup = pd.read_excel(output_dup_reg_path) if output_dup_reg_path.exists() else pd.DataFrame()
 
         if s_ann.empty or s_hash.empty:
             print("  Staging anotaciones.xlsx or hashes.xlsx is missing/empty. Skipping merge.")
             return
 
-        # --- Load output data ---
-        o_ann = pd.read_excel(output_ann_path) if output_ann_path.exists() else pd.DataFrame()
-        o_hash = pd.read_excel(output_hash_path) if output_hash_path.exists() else pd.DataFrame()
-
-        # --- Handle case where output is empty ---
-        if o_ann.empty or o_hash.empty:
-            print("  Output anotaciones.xlsx or hashes.xlsx is new or empty.")
-            if not self.dry_run:
-                shutil.copy2(staging_ann_path, output_ann_path)
-                shutil.copy2(staging_hash_path, output_hash_path)
-            self.stats['registry_records_merged'] += len(s_ann)
-            print(f"    Copied {len(s_ann)} annotation and {len(s_hash)} hash records.")
-            return
-
-        print(f"\n  Cross-referenced merge (pHash/md5, uuid-linked): anotaciones.xlsx + hashes.xlsx")
-
-        # --- Data Prep and Lookups ---
+        # Prepare lookups
         for df in [s_ann, s_hash, o_ann, o_hash]:
             if 'uuid' in df.columns:
                 df['uuid'] = df['uuid'].astype(str)
 
-        s_ann_by_uuid = s_ann.set_index('uuid').to_dict('index')
-        o_ann_by_uuid = o_ann.set_index('uuid').to_dict('index')
+        s_ann_by_uuid = s_ann.set_index('uuid').to_dict('index') if not s_ann.empty and 'uuid' in s_ann.columns else {}
+        o_ann_by_uuid = o_ann.set_index('uuid').to_dict('index') if not o_ann.empty and 'uuid' in o_ann.columns else {}
 
-        o_uuids_by_phash: Dict[str, List[str]] = {}
-        if 'uuid' in o_hash.columns and 'phash' in o_hash.columns:
-            o_hash_phash = o_hash.dropna(subset=['phash'])
-            for phash, group in o_hash_phash.groupby('phash'):
-                if phash: o_uuids_by_phash[str(phash)] = group['uuid'].tolist()
+        # Build hash indexes for output
+        o_hash_by_md5 = defaultdict(list)
+        o_hash_by_phash = defaultdict(list)
+        o_hash_phash_map = {}
+        o_hash_md5_map = {}
+        phash_threshold = self.image_hasher.phash_threshold
+        for _, row in o_hash.iterrows():
+            md5 = str(row.get('md5_hash', ''))
+            phash = str(row.get('phash', ''))
+            uuid = str(row.get('uuid', ''))
+            if md5:
+                o_hash_by_md5[md5].append(uuid)
+                o_hash_md5_map[uuid] = md5
+            if phash:
+                o_hash_by_phash[phash].append(uuid)
+                o_hash_phash_map[uuid] = phash
 
-        o_uuids_by_md5: Dict[str, List[str]] = {}
-        if 'uuid' in o_hash.columns and 'md5_hash' in o_hash.columns:
-            o_hash_md5 = o_hash.dropna(subset=['md5_hash'])
-            for md5, group in o_hash_md5.groupby('md5_hash'):
-                if md5: o_uuids_by_md5[str(md5)] = group['uuid'].tolist()
-        
-        initial_o_hash_len = len(o_hash) # Store initial length for stats later
+        # Prepare new output annotation and hash DataFrames
+        output_ann_copy = o_ann.copy()
+        output_hash_copy = o_hash.copy()
+        output_dup_copy = o_dup.copy()
 
-        # --- Main Loop ---
+        # Track which staging UUIDs are duplicates
+        duplicate_uuids = set()
         processed_output_uuids = set()
-        # new_hash_rows will no longer be used for final o_hash construction as we will take a union of all hashes
         rows_auto_merged = 0
         conflicts_resolved = 0
-        
-        output_ann_copy = o_ann.copy() # Work on a copy to apply changes
+        new_ann_rows = []
+        new_hash_rows = []
+        new_dup_rows = []
 
         for _, s_hash_row in s_hash.iterrows():
-            s_uuid = s_hash_row.get('uuid')
+            s_uuid = str(s_hash_row.get('uuid', ''))
             s_phash = str(s_hash_row.get('phash', ''))
             s_md5 = str(s_hash_row.get('md5_hash', ''))
+            s_ann_row = s_ann_by_uuid.get(s_uuid)
+            if not s_uuid or not s_ann_row:
+                continue
 
-            if not s_uuid or not s_ann_by_uuid.get(s_uuid):
-                continue  # Skip hash rows without a uuid or annotation link
+            # 1. Try exact pHash match
+            match_uuid = None
+            match_type = None
+            if s_phash and s_phash in o_hash_by_phash:
+                match_uuid = o_hash_by_phash[s_phash][0]
+                match_type = 'pHash'
+            # 2. Try near-duplicate pHash (threshold)
+            elif s_phash:
+                for o_phash, uuids in o_hash_by_phash.items():
+                    if o_phash and s_phash and o_phash != s_phash:
+                        dist = self.image_hasher.hamming_distance(s_phash, o_phash)
+                        if 0 < dist <= phash_threshold:
+                            match_uuid = uuids[0]
+                            match_type = f'pHash~{dist}'
+                            break
+            # 3. Try exact MD5 match
+            if not match_uuid and s_md5 and s_md5 in o_hash_by_md5:
+                match_uuid = o_hash_by_md5[s_md5][0]
+                match_type = 'md5'
 
-            matched_o_uuid, match_type, match_value = None, None, None
-
-            # 1. Match by pHash
-            if s_phash and s_phash in o_uuids_by_phash:
-                matched_o_uuid = o_uuids_by_phash[s_phash][0]
-                match_type, match_value = 'pHash', s_phash
-            # 2. Match by md5 (fallback)
-            elif s_md5 and s_md5 in o_uuids_by_md5:
-                matched_o_uuid = o_uuids_by_md5[s_md5][0]
-                match_type, match_value = 'md5', s_md5
-            
-            s_row = pd.Series(s_ann_by_uuid.get(s_uuid))
-
-            if matched_o_uuid and o_ann_by_uuid.get(matched_o_uuid):
-                if matched_o_uuid in processed_output_uuids:
-                    continue # Already matched this output record
-                processed_output_uuids.add(matched_o_uuid)
-                
-                o_row_dict = o_ann_by_uuid.get(matched_o_uuid)
-                o_row = pd.Series(o_row_dict)
-                
-                # Find DataFrame index for the output row to update it
-                matched_idx = output_ann_copy[output_ann_copy['uuid'] == matched_o_uuid].index[0]
-
-                # --- Always accumulate original_path ---
+            if match_uuid and match_uuid in o_ann_by_uuid:
+                # DUPLICATE: add to duplicados_registro, do NOT add to hashes.xlsx
+                duplicate_uuids.add(s_uuid)
+                s_row = pd.Series(s_ann_row)
+                o_row = pd.Series(o_ann_by_uuid[match_uuid])
+                # Always accumulate original_path
                 if 'original_path' in s_row.index and 'original_path' in o_row.index:
                     s_orig = str(s_row.get('original_path', ''))
                     o_orig = str(o_row.get('original_path', ''))
                     merged_paths = self._merge_original_paths(o_orig, s_orig)
                     if merged_paths != o_orig:
-                        output_ann_copy.at[matched_idx, 'original_path'] = merged_paths
+                        output_ann_copy.loc[output_ann_copy['uuid'] == match_uuid, 'original_path'] = merged_paths
 
-                # --- Field-by-field comparison ---
-                discrepancies: Dict[str, Dict[str, str]] = {}
+                # Field-by-field comparison for annotation
+                discrepancies = {}
                 skip_cols = {'created_at', 'updated_at', 'timestamp', 'uuid', 'id', 'current_path', 'original_path'}
-                
                 for col in s_row.index:
                     if col in skip_cols or col not in o_row.index:
                         continue
-                    
                     s_val = s_row.get(col)
                     o_val = o_row.get(col)
                     s_str = str(s_val) if pd.notna(s_val) else ''
                     o_str = str(o_val) if pd.notna(o_val) else ''
-
-                    if s_str == o_str: continue
-
-                    if not o_str and s_str: # Staging fills a gap
-                        if not self.dry_run: output_ann_copy.at[matched_idx, col] = s_val
+                    if s_str == o_str:
+                        continue
+                    if not o_str and s_str:
+                        if not self.dry_run:
+                            output_ann_copy.loc[output_ann_copy['uuid'] == match_uuid, col] = s_val
                         rows_auto_merged += 1
-                    elif o_str and not s_str: # Output has data
+                    elif o_str and not s_str:
                         pass
-                    else: # Real discrepancy
+                    else:
                         discrepancies[col] = {'staging': s_str, 'output': o_str}
-                
-                if not discrepancies: continue
 
-                # --- Real conflict → prompt user ---
-                ctx_lines = [
-                    f"specimen_id (existing): {o_row.get('specimen_id', '(no id)')}",
-                    f"specimen_id (staging):  {s_row.get('specimen_id', '(no id)')}",
-                    f"original_path (existing): {o_row.get('original_path', '')}",
-                    f"original_path (staging):  {s_row.get('original_path', '')}",
-                    "",
-                    f"Match reason: {match_type} match ({match_value})"
-                ]
-                
-                table = self._build_comparison_table(discrepancies, f"{match_type} match", context_info=ctx_lines)
-                
-                decision_request = create_merge_registry_conflict_decision(
-                    registry_name='anotaciones.xlsx',
-                    match_label=f"Merge conflict ({match_type}={match_value})",
-                    comparison_table=table,
-                    context_info={} # Simplified for now
+                # Prompt for real conflicts
+                if discrepancies:
+                    ctx_lines = [
+                        f"specimen_id (existing): {o_row.get('specimen_id', '(no id)')}",
+                        f"specimen_id (staging):  {s_row.get('specimen_id', '(no id)')}",
+                        f"original_path (existing): {o_row.get('original_path', '')}",
+                        f"original_path (staging):  {s_row.get('original_path', '')}",
+                        "",
+                        f"Match reason: {match_type} match",
+                    ]
+                    # When campaign_year is disputed, show EXIF years to help decide
+                    if 'campaign_year' in discrepancies:
+                        o_cur = str(o_row.get('current_path', '')) if pd.notna(o_row.get('current_path')) else ''
+                        s_cur = str(s_row.get('current_path', '')) if pd.notna(s_row.get('current_path')) else ''
+                        o_exif_year, _ = self._extract_exif_year_from_paths([o_cur])
+                        s_exif_year, _ = self._extract_exif_year_from_paths([s_cur])
+                        ctx_lines.append("")
+                        ctx_lines.append(f"EXIF year (existing): {o_exif_year if o_exif_year else 'not available'}")
+                        ctx_lines.append(f"EXIF year (staging):  {s_exif_year if s_exif_year else 'not available'}")
+                    table = self._build_comparison_table(discrepancies, f"{match_type} match", context_info=ctx_lines)
+                    # Subdir key from original_path
+                    orig_path = s_row.get('original_path', '') or o_row.get('original_path', '')
+                    subdir_key = self._extract_subdir_key(orig_path)
+                    cached = self._subdir_merge_choices.get(subdir_key)
+                    choice = None
+                    if cached is not None:
+                        choice = cached
+                    else:
+                        decision_request = create_merge_registry_conflict_decision(
+                            registry_name='anotaciones.xlsx',
+                            match_label=f"Merge conflict ({match_type})",
+                            comparison_table=table,
+                            context_info={}
+                        )
+                        result = self.interaction_manager.request_decision(decision_request)
+                        if result.outcome == DecisionOutcome.APPLY_TO_SUBDIRECTORY:
+                            sel = result.selected_option if result.selected_option is not None else 0
+                            self._subdir_merge_choices[subdir_key] = sel
+                            choice = sel
+                        else:
+                            choice = result.selected_option if result.selected_option is not None else 0
+                    if choice == 1:
+                        for col in discrepancies:
+                            if not self.dry_run:
+                                output_ann_copy.loc[output_ann_copy['uuid'] == match_uuid, col] = s_row[col]
+                        conflicts_resolved += 1
+                        self.stats['registry_conflicts'] += 1
+
+                # Add the duplicate row to duplicados_registro
+                # Re-inject uuid (set_index('uuid') removed it from the dict)
+                dup_dict = dict(s_ann_row)
+                dup_dict['uuid'] = s_uuid
+                new_dup_rows.append(pd.Series(dup_dict))
+                continue
+
+            # NOT DUPLICATE: add to new_ann_rows and new_hash_rows
+            # Re-inject uuid (set_index('uuid') removed it from the dict)
+            ann_dict = dict(s_ann_row)
+            ann_dict['uuid'] = s_uuid
+            new_ann_rows.append(pd.Series(ann_dict))
+            new_hash_rows.append(s_hash_row)
+
+        # Cross-check: compare registry-level duplicates with file-level duplicates
+        if self._file_level_duplicate_uuids:
+            only_file = self._file_level_duplicate_uuids - duplicate_uuids
+            only_reg = duplicate_uuids - self._file_level_duplicate_uuids
+            if only_file:
+                logger.warning(
+                    f"File-level detected {len(only_file)} duplicate UUID(s) "
+                    f"not caught by registry merge: {list(only_file)[:5]}"
                 )
-                result = self.interaction_manager.request_decision(decision_request)
-                choice = result.selected_option if result.selected_option is not None else 0
-                
-                if choice == 1: # Use staging
-                    for col in discrepancies:
-                        if not self.dry_run: output_ann_copy.at[matched_idx, col] = s_row[col]
+            if only_reg:
+                logger.warning(
+                    f"Registry merge detected {len(only_reg)} duplicate UUID(s) "
+                    f"not caught by file-level merge: {list(only_reg)[:5]}"
+                )
+            # Merge both sets so removals cover both passes
+            duplicate_uuids = duplicate_uuids | self._file_level_duplicate_uuids
 
-                conflicts_resolved += 1
-                self.stats['registry_conflicts'] += 1
+        # Append new annotation and hash records (non-duplicates only)
+        if new_ann_rows:
+            output_ann_copy = pd.concat([output_ann_copy, pd.DataFrame(new_ann_rows)], ignore_index=True)
+        if new_hash_rows:
+            output_hash_copy = pd.concat([output_hash_copy, pd.DataFrame(new_hash_rows)], ignore_index=True)
+            # Remove any hash rows whose uuid is in duplicate_uuids
+            output_hash_copy = output_hash_copy[~output_hash_copy['uuid'].isin(list(duplicate_uuids))]
 
-        # --- Append new records to annotations ---
-        # We need to explicitly find new annotation records (by UUID) that don't have a match in output
-        new_uuids_for_annotations = [s_uuid for s_uuid in s_ann_by_uuid if s_uuid not in processed_output_uuids]
-        new_ann_rows_to_append = s_ann[s_ann['uuid'].isin(new_uuids_for_annotations)]
+        # Append new duplicates to duplicados_registro
+        if new_dup_rows:
+            output_dup_copy = pd.concat([output_dup_copy, pd.DataFrame(new_dup_rows)], ignore_index=True)
+            print(f"    Added {len(new_dup_rows)} duplicate records to duplicados_registro.xlsx")
 
-        if not new_ann_rows_to_append.empty:
-            output_ann_copy = pd.concat([output_ann_copy, new_ann_rows_to_append], ignore_index=True)
-            self.stats['registry_records_merged'] += len(new_ann_rows_to_append)
+        # Enforce canonical column order (uuid first) to match pipeline output
+        _canonical_ann_cols = [
+            'uuid', 'specimen_id', 'original_path', 'current_path',
+            'macroclass_label', 'class_label', 'genera_label',
+            'campaign_year', 'fuente', 'comentarios', 'created_at',
+        ]
+        def _reorder_columns(df: pd.DataFrame, preferred: list) -> pd.DataFrame:
+            ordered = [c for c in preferred if c in df.columns]
+            remaining = [c for c in df.columns if c not in ordered]
+            return df[ordered + remaining]
 
-        # --- Consolidate all hash records and deduplicate by UUID ---
-        # Start with all existing output hash records
-        consolidated_hashes_df = o_hash.copy()
-
-        # Add all staging hash records. If there are UUID overlaps, we want to keep the staging version.
-        # This implicitly handles new hash records and updates for existing UUIDs.
-        if not s_hash.empty:
-            consolidated_hashes_df = pd.concat([consolidated_hashes_df, s_hash], ignore_index=True)
-            if 'uuid' in consolidated_hashes_df.columns:
-                consolidated_hashes_df.drop_duplicates(subset=['uuid'], keep='last', inplace=True)
-
-        # Update o_hash with the consolidated (unique UUID) hash DataFrame
-        o_hash = consolidated_hashes_df
-        self.stats['registry_records_merged'] += (len(o_hash) - initial_o_hash_len)
+        output_ann_copy = _reorder_columns(output_ann_copy, _canonical_ann_cols)
+        output_dup_copy = _reorder_columns(output_dup_copy, _canonical_ann_cols)
 
         if not self.dry_run:
             output_ann_copy.to_excel(output_ann_path, index=False)
-            o_hash.to_excel(output_hash_path, index=False)
-            
+            output_hash_copy.to_excel(output_hash_path, index=False)
+            if not output_dup_copy.empty:
+                output_dup_reg_path.parent.mkdir(parents=True, exist_ok=True)
+                output_dup_copy.to_excel(output_dup_reg_path, index=False)
+
         print(f"    Annotation records processed: {len(s_ann)}")
-        print(f"    Matched records: {len(processed_output_uuids)}")
-        print(f"    New records appended: {len(new_ann_rows_to_append)}")
+        print(f"    Duplicates detected: {len(new_dup_rows)}")
+        print(f"    New records appended: {len(new_ann_rows)}")
         if rows_auto_merged: print(f"    Fields auto-merged (gap-fill): {rows_auto_merged}")
         if conflicts_resolved: print(f"    Conflicts resolved: {conflicts_resolved}")
 
@@ -1442,15 +1599,12 @@ class OutputMerger:
                 # Build table and request decision (include context dict)
                 table = self._build_comparison_table(discrepancies, match_display, context_info=ctx_lines)
 
-                # Determine subdir key
+                # Determine subdir key (handles ;-separated original_path)
                 subdir_key = ''
                 try:
                     o_orig = context_dict.get('original_path_existing', '')
                     s_orig = context_dict.get('original_path_staging', '')
-                    if o_orig:
-                        subdir_key = str(Path(o_orig).parent)
-                    elif s_orig:
-                        subdir_key = str(Path(s_orig).parent)
+                    subdir_key = self._extract_subdir_key(o_orig or s_orig)
                 except Exception:
                     subdir_key = ''
 
@@ -1615,6 +1769,13 @@ class OutputMerger:
         # Step 0: Load pre-computed hashes from both registries
         self._load_hash_registries()
         
+        # Step 0b: Ensure all staging images have hashes (prompt user if not)
+        self._check_missing_hashes()
+        # Reset registry-hit counter — _check_missing_hashes also calls
+        # _get_file_hashes which increments the stat, but that is just a
+        # validation step and should not inflate the final count.
+        self.stats['hashes_from_registry'] = 0
+        
         # Step 1: Merge files
         self._merge_files()
         
@@ -1633,7 +1794,6 @@ class OutputMerger:
         if self.stats['files_skipped_near_duplicate']:
             print(f"    (near-duplicates):     {self.stats['files_skipped_near_duplicate']}")
         print(f"  Conflicts (files):       {self.stats['files_skipped_conflict']}")
-        print(f"  Registry records merged: {self.stats['registry_records_merged']}")
         print(f"  Registry conflicts:      {self.stats['registry_conflicts']}")
         print(f"  Hashes from registry:    {self.stats['hashes_from_registry']}")
         print(f"  Hashes computed:         {self.stats['hashes_computed']}")

@@ -22,9 +22,11 @@ import time
 import logging
 import json
 import re
+import threading
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 # Load environment variables from .env file
@@ -267,7 +269,7 @@ class DirectoryAnalysis:
 # =============================================================================
 
 class RateLimiter:
-    """Simple rate limiter for API calls."""
+    """Thread-safe rate limiter for API calls."""
     
     def __init__(self, requests_per_minute: int = 15):
         self.requests_per_minute = requests_per_minute
@@ -275,29 +277,31 @@ class RateLimiter:
         self.last_request_time = 0.0
         self.request_count = 0
         self.window_start = time.time()
+        self._lock = threading.Lock()
     
     def wait_if_needed(self):
-        """Wait if we're exceeding the rate limit."""
-        current_time = time.time()
-        
-        if current_time - self.window_start >= 60:
-            self.request_count = 0
-            self.window_start = current_time
-        
-        if self.request_count >= self.requests_per_minute:
-            sleep_time = 60 - (current_time - self.window_start)
-            if sleep_time > 0:
-                logger.info(f"Rate limit reached, sleeping for {sleep_time:.1f}s")
-                time.sleep(sleep_time)
+        """Wait if we're exceeding the rate limit (thread-safe)."""
+        with self._lock:
+            current_time = time.time()
+            
+            if current_time - self.window_start >= 60:
                 self.request_count = 0
-                self.window_start = time.time()
-        
-        elapsed = current_time - self.last_request_time
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        
-        self.last_request_time = time.time()
-        self.request_count += 1
+                self.window_start = current_time
+            
+            if self.request_count >= self.requests_per_minute:
+                sleep_time = 60 - (current_time - self.window_start)
+                if sleep_time > 0:
+                    logger.info(f"Rate limit reached, sleeping for {sleep_time:.1f}s")
+                    time.sleep(sleep_time)
+                    self.request_count = 0
+                    self.window_start = time.time()
+            
+            elapsed = current_time - self.last_request_time
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            
+            self.last_request_time = time.time()
+            self.request_count += 1
 
 
 # =============================================================================
@@ -605,7 +609,11 @@ def _normalize_extraction(extracted: dict, match: re.Match = None) -> dict:
     specimen_raw = res.get('specimen_id')
     # Try to parse specimen_id if present
     if specimen_raw:
-        m = re.match(r"^\s*(?P<prefix>[A-Za-z0-9\-]+)[-\s_/]*(?P<number>\d{1,10})(?:[-\s_/]*(?P<plate>[A-Za-z]{1,2}))?\s*$",
+        # NOTE: prefix must be alpha-only (with hyphens between alpha segments)
+        # to avoid greedily consuming digits from the numeric part.
+        # E.g. "LH-15324" must parse as prefix=LH, number=15324
+        #       not prefix=LH-1532, number=4.
+        m = re.match(r"^\s*(?P<prefix>[A-Za-z]+(?:-[A-Za-z]+)*)[-\s_/]*(?P<number>\d{1,10})(?:[-\s_/]*(?P<plate>[A-Za-z]{1,2}))?\s*$",
                      specimen_raw)
         if m:
             prefix = m.group('prefix')
@@ -929,28 +937,51 @@ Extract any specimen ID, year, or taxonomic information encoded in the filename.
         self,
         filenames: List[str],
         directory_context: str = None,
-        progress_callback: callable = None
+        progress_callback: callable = None,
+        max_workers: int = 5,
     ) -> Dict[str, FileAnalysis]:
         """
-        Analyze multiple files one by one (fallback mode).
+        Analyze multiple files concurrently (fallback mode).
+        
+        Uses a thread pool to make multiple LLM calls in parallel,
+        respecting the rate limiter.  The rate limiter is thread-safe,
+        so workers will queue up when the RPM limit is approached.
         
         Args:
             filenames: Files to analyze
             directory_context: Optional directory path
             progress_callback: Called with (current, total)
+            max_workers: Maximum concurrent LLM requests (default 5)
             
         Returns:
             Dict mapping filename to FileAnalysis
         """
         results = {}
         total = len(filenames)
-        
-        for i, fn in enumerate(filenames):
-            results[fn] = self.analyze_file(fn, directory_context)
-            
-            if progress_callback:
-                progress_callback(i + 1, total)
-        
+        completed = 0
+        _progress_lock = threading.Lock()
+
+        def _analyze_one(fn: str) -> tuple:
+            """Worker: analyze a single file and return (filename, result)."""
+            return fn, self.analyze_file(fn, directory_context)
+
+        # Cap workers to the number of files (no point spawning idle threads)
+        workers = min(max_workers, total)
+        logger.info(f"Concurrent per-file analysis: {total} files, {workers} workers")
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_fn = {
+                executor.submit(_analyze_one, fn): fn for fn in filenames
+            }
+            for future in as_completed(future_to_fn):
+                fn, analysis = future.result()
+                results[fn] = analysis
+
+                if progress_callback:
+                    with _progress_lock:
+                        completed += 1
+                        progress_callback(completed, total)
+
         return results
     
     # -------------------------------------------------------------------------
@@ -1141,13 +1172,30 @@ class GitHubModelsClient(BaseLLMClient):
 class GeminiClient(BaseLLMClient):
     """
     Client for Google Gemini API with structured output and thinking support.
+
+    Supports both thinking control mechanisms:
+    - thinkingLevel (Gemini 3.x / 2.0): MINIMAL, LOW, MEDIUM, HIGH
+    - thinkingBudget (Gemini 2.5.x): 0 (off), -1 (dynamic), or 128-24576
+
+    The client auto-detects the model family from the model name and uses
+    the appropriate parameter.
     """
     
-    # Thinking levels mapped to task complexity
+    # Thinking levels mapped to task complexity.
+    # Valid thinkingLevel values: MINIMAL, LOW, MEDIUM, HIGH  (no "NONE"!)
+    # MINIMAL is only supported on Gemini 3 Flash; LOW is the safest fast option.
     THINKING_LEVELS = {
-        'path_analysis': 'MINIMAL',           # Quick thinking - fast path analysis
-        'filename_regex': 'MINIMAL',          # Quick thinking - fast regex generation
-        'file_analysis': 'MINIMAL',           # Quick thinking - simple filename parsing
+        'path_analysis': 'LOW',           # Quick thinking - fast path analysis
+        'filename_regex': 'LOW',          # Quick thinking - fast regex generation
+        'file_analysis': 'LOW',           # Quick thinking - simple filename parsing
+    }
+
+    # Thinking budgets for Gemini 2.5 models (token count).
+    # 0 = thinking off, -1 = dynamic, or an integer in [128, 24576].
+    THINKING_BUDGETS = {
+        'path_analysis': 1024,            # Light budget - fast path analysis
+        'filename_regex': 1024,           # Light budget - fast regex generation
+        'file_analysis': 1024,            # Light budget - simple filename parsing
     }
     
     def __init__(
@@ -1170,13 +1218,22 @@ class GeminiClient(BaseLLMClient):
         
         self.model_name = model or config.llm_model
         self.enable_thinking = enable_thinking
+        self._is_2_5_model = '2.5' in self.model_name or '25-' in self.model_name
         
         # Initialize the new google.genai client with API key
         self.client = genai.Client(api_key=self.api_key)
         
+        # Warn if using deprecated 2.0 models
+        if '2.0' in self.model_name or '20-' in self.model_name:
+            logger.warning(
+                f"Model {self.model_name} is deprecated by Google. "
+                f"Consider upgrading to gemini-2.5-flash or gemini-3-flash-preview."
+            )
+        
         logger.info(
             f"Initialized Gemini client with model {self.model_name} "
-            f"(thinking: {'enabled' if enable_thinking else 'disabled'})"
+            f"(thinking: {'enabled' if enable_thinking else 'disabled'}, "
+            f"mode: {'thinkingBudget' if self._is_2_5_model else 'thinkingLevel'})"
         )
     
     def _call_api(self, system_prompt: str, user_prompt: str, schema_name: str = None) -> str:
@@ -1203,21 +1260,50 @@ class GeminiClient(BaseLLMClient):
             logger.debug(f"[STRUCTURED_OUTPUT] schema={schema_name}")
         
         # Add thinking configuration if enabled (limits how much the model thinks)
-        if self.enable_thinking and schema_name in self.THINKING_LEVELS:
-            thinking_level = self.THINKING_LEVELS[schema_name]
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_level=thinking_level,
-            )
-            logger.debug(f"[THINKING] schema={schema_name} | level={thinking_level}")
+        if self.enable_thinking and schema_name:
+            if self._is_2_5_model and schema_name in self.THINKING_BUDGETS:
+                # Gemini 2.5: use thinkingBudget (token count)
+                budget = self.THINKING_BUDGETS[schema_name]
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_budget=budget,
+                )
+                logger.debug(f"[THINKING] schema={schema_name} | budget={budget}")
+            elif schema_name in self.THINKING_LEVELS:
+                # Gemini 3.x / 2.0: use thinkingLevel
+                thinking_level = self.THINKING_LEVELS[schema_name]
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=thinking_level,
+                )
+                logger.debug(f"[THINKING] schema={schema_name} | level={thinking_level}")
         
         # Create the GenerateContentConfig with all parameters
         generate_config = types.GenerateContentConfig(**config_kwargs)
         
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=full_prompt,
-            config=generate_config
-        )
+        # Retry loop for transient server errors (503 Service Unavailable, 429 Rate Limit, etc.)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=full_prompt,
+                    config=generate_config
+                )
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                retryable = any(token in err_str for token in [
+                    "503", "service unavailable", "overloaded",
+                    "429", "resource exhausted", "rate limit",
+                    "temporarily unavailable", "internal error",
+                ])
+                if attempt < max_retries and retryable:
+                    logger.warning(
+                        f"[RETRY] Attempt {attempt}/{max_retries} failed: "
+                        f"{type(e).__name__}: {e}. Retrying in 2s..."
+                    )
+                    time.sleep(2)
+                    continue
+                raise
         
         result = response.text
         logger.debug(f"[LLM_RESPONSE] schema={schema_name} | response={result[:500]}")

@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any, Callable, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import config, detect_collection, COLLECTIONS, get_macroclass_folder
 from .logger_module import DataOrderingLogger, LogAction
@@ -915,27 +916,42 @@ class PipelineOrchestrator:
                 
                 # Only do per-file fallback for small numbers
                 if len(failures) <= 20:
-                    print(f"       Analyzing {len(failures)} files individually...")
+                    n_workers = min(5, len(failures))
+                    print(f"       Analyzing {len(failures)} files concurrently ({n_workers} workers)...")
                     
-                    for j, fn in enumerate(failures):
-                        try:
-                            file_analysis = client.analyze_file(fn, str(dir_path))
-                            file_analyses[fn] = file_analysis.to_dict()
-                            stats['per_file_fallbacks'] += 1
-                            
-                            if file_analysis.specimen_id:
-                                print(f"       [{j+1}/{len(failures)}] {fn} → {file_analysis.specimen_id}")
-                                self.action_logger.llm_per_file(
-                                    fn, file_analysis.specimen_id,
-                                    f"class={file_analysis.taxonomic_class}, confidence={file_analysis.confidence:.1%}"
-                                )
-                            else:
-                                print(f"       [{j+1}/{len(failures)}] {fn} → No ID extracted")
-                                self.action_logger.llm_per_file(fn, None, "No ID extracted")
+                    import threading as _thr
+                    _print_lock = _thr.Lock()
+                    _done_count = [0]  # mutable counter for closure
+
+                    def _analyze_single(fn):
+                        return fn, client.analyze_file(fn, str(dir_path))
+
+                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                        future_map = {
+                            pool.submit(_analyze_single, fn): fn for fn in failures
+                        }
+                        for future in as_completed(future_map):
+                            fn = future_map[future]
+                            try:
+                                _, file_analysis = future.result()
+                                file_analyses[fn] = file_analysis.to_dict()
+                                stats['per_file_fallbacks'] += 1
                                 
-                        except Exception as e:
-                            logger.warning(f"Per-file analysis failed for {fn}: {e}")
-                            self.action_logger.llm_error("per_file_analysis", fn, str(e))
+                                with _print_lock:
+                                    _done_count[0] += 1
+                                    j = _done_count[0]
+                                    if file_analysis.specimen_id:
+                                        print(f"       [{j}/{len(failures)}] {fn} → {file_analysis.specimen_id}")
+                                        self.action_logger.llm_per_file(
+                                            fn, file_analysis.specimen_id,
+                                            f"class={file_analysis.taxonomic_class}, confidence={file_analysis.confidence:.1%}"
+                                        )
+                                    else:
+                                        print(f"       [{j}/{len(failures)}] {fn} → No ID extracted")
+                                        self.action_logger.llm_per_file(fn, None, "No ID extracted")
+                            except Exception as e:
+                                logger.warning(f"Per-file analysis failed for {fn}: {e}")
+                                self.action_logger.llm_error("per_file_analysis", fn, str(e))
                             
                 else:
                     print(f"       SKIPPED ({len(failures)} files is too many for per-file analysis)")
@@ -2326,28 +2342,29 @@ class PipelineOrchestrator:
         for path_str, pf_data in self.state.processed_files.items():
             file_type_str = pf_data.get('file_type')
             file_type = FileType(file_type_str) if file_type_str else FileType.OTHER
-            
+
             if file_type == FileType.IMAGE:
-                # --- Hashes registry: ALL images (including duplicates) ---
-                file_uuid = pf_data.get('file_uuid') or ImageRecord.generate_uuid()
-                md5 = pf_data.get('md5_hash', '')
-                phash = pf_data.get('phash', '')
-                excel_manager.add_hash(
-                    uuid=file_uuid,
-                    md5_hash=md5,
-                    phash=phash,
-                    file_path=Path(pf_data.get('destination_path') or path_str),
-                )
-                
+                # --- Only add non-duplicates to the hash registry ---
+                if not pf_data.get('is_duplicate'):
+                    file_uuid = pf_data.get('file_uuid') or ImageRecord.generate_uuid()
+                    md5 = pf_data.get('md5_hash', '')
+                    phash = pf_data.get('phash', '')
+                    excel_manager.add_hash(
+                        uuid=file_uuid,
+                        md5_hash=md5,
+                        phash=phash,
+                        file_path=Path(pf_data.get('destination_path') or path_str),
+                    )
+
                 # --- Check if duplicate ---
                 if pf_data.get('is_duplicate'):
                     # Build comments for duplicate record
                     comments = [f"[AUTO] duplicate_of={pf_data.get('duplicate_of')}"]
                     if pf_data.get('needs_review'):
                         comments.append(f"[REVIEW] {pf_data.get('review_reason')}")
-                    
+
                     dup_record = ImageRecord(
-                        uuid=file_uuid,
+                        uuid=pf_data.get('file_uuid'),
                         specimen_id=pf_data.get('specimen_id'),
                         original_path=path_str,
                         current_path=pf_data.get('destination_path'),
@@ -2365,7 +2382,7 @@ class PipelineOrchestrator:
                         specimen_id=pf_data.get('specimen_id')
                     )
                     continue  # Do NOT add duplicates to main anotaciones.xlsx
-                
+
                 # --- Main anotaciones.xlsx: non-duplicate images only ---
                 comments = []
                 if pf_data.get('needs_review'):
@@ -2374,7 +2391,7 @@ class PipelineOrchestrator:
                     comments.append(f"[AUTO] collection={pf_data.get('collection_code')}")
                 if pf_data.get('specimen_id'):
                     comments.append(f"[AUTO] specimen_id extracted from path/filename")
-                
+
                 # Accumulate original_paths: if this file has duplicates,
                 # collect all their original_paths into a ';'-separated list.
                 all_orig_paths = [path_str]
@@ -2384,12 +2401,12 @@ class PipelineOrchestrator:
                         if dup_orig and dup_orig not in all_orig_paths:
                             all_orig_paths.append(dup_orig)
                 combined_original_path = '; '.join(all_orig_paths)
-                
+
                 # Get macroclass — None if unknown (no more Unsorted_Macroclass)
                 macroclass = pf_data.get('macroclass') or get_macroclass_folder(pf_data.get('taxonomic_class'))
-                
+
                 record = ImageRecord(
-                    uuid=file_uuid,
+                    uuid=pf_data.get('file_uuid'),
                     specimen_id=pf_data.get('specimen_id'),
                     original_path=combined_original_path,
                     current_path=pf_data.get('destination_path'),
@@ -2406,7 +2423,7 @@ class PipelineOrchestrator:
                     "image", pf_data.get('filename', ''),
                     specimen_id=pf_data.get('specimen_id')
                 )
-                
+
             elif file_type == FileType.TEXT:
                 original_path = Path(path_str)
                 current_path = Path(pf_data.get('destination_path') or path_str)

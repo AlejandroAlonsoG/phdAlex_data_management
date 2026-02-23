@@ -37,9 +37,9 @@
             "module": "data_ordering.merge_output",
             "args": [
                 "--staging",
-                "C:\\merge_1j",
+                "C:\\merge_3a",
                 "--output",
-                "C:\\merge_2e"
+                "C:\\merge_4a"
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
