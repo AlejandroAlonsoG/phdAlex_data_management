@@ -179,6 +179,11 @@ class OutputMerger:
         self._staging_hashes: Dict[str, Dict[str, str]] = {}
         self._output_hashes: Dict[str, Dict[str, str]] = {}
 
+        # UUID-based hash indexes (populated by _load_hash_registries)
+        # Maps uuid (8-char hex) → {'md5_hash': str, 'phash': str, 'uuid': str}
+        self._staging_uuid_index: Dict[str, Dict[str, str]] = {}
+        self._output_uuid_index: Dict[str, Dict[str, str]] = {}
+
         # Reverse indexes for the OUTPUT side (populated by _build_output_hash_index)
         # md5 → [file_path, …]; phash → [file_path, …]
         self._output_md5_index: Dict[str, List[str]] = {}
@@ -237,6 +242,65 @@ class OutputMerger:
                 continue
         return None, None
 
+    def _collect_exif_years_from_originals(
+        self,
+        existing_original_path: str,
+        staging_original_path: str,
+        existing_file: Optional[str] = None,
+        staging_file: Optional[str] = None,
+    ) -> List[str]:
+        """Extract EXIF year from every original file and return context lines.
+
+        Parameters
+        ----------
+        existing_original_path : str
+            Semicolon-separated original paths from the output/existing record.
+        staging_original_path : str
+            Semicolon-separated original paths from the staging record.
+        existing_file / staging_file : str, optional
+            Current (renamed) file paths, used as fallback when original paths
+            are unavailable.
+
+        Returns a list of human-readable lines such as:
+            EXIF years from original files:
+              [existing] D:\...\IMG001.ORF  →  2009
+              [staging]  D:\...\IMG002.ORF  →  2011
+        """
+        lines: List[str] = []
+        entries: List[tuple] = []  # (label, path_str)
+
+        # Collect existing paths
+        if existing_original_path:
+            for p in existing_original_path.split(';'):
+                p = p.strip()
+                if p:
+                    entries.append(('existing', p))
+        if existing_file and not existing_original_path:
+            entries.append(('existing', existing_file))
+
+        # Collect staging paths
+        if staging_original_path:
+            for p in staging_original_path.split(';'):
+                p = p.strip()
+                if p:
+                    entries.append(('staging', p))
+        if staging_file and not staging_original_path:
+            entries.append(('staging', staging_file))
+
+        if not entries:
+            return lines
+
+        lines.append('')
+        lines.append('EXIF years from original files:')
+        for label, path_str in entries:
+            year, _ = self._extract_exif_year_from_paths([path_str])
+            year_display = str(year) if year else '(no EXIF / not found)'
+            # Shorten display for readability
+            fname = Path(path_str).name if path_str else '?'
+            lines.append(f'  [{label:8s}] {fname}  →  {year_display}')
+
+        return lines
+
     def _generate_new_filename(self, file_path: Path, campaign_year: Optional[int] = None, specimen_id: Optional[str] = None) -> str:
         """
         Generate filename similar to the main pipeline.
@@ -267,19 +331,39 @@ class OutputMerger:
                 return json.load(f)
         return None
     
+    @staticmethod
+    def _extract_uuid_from_filename(file_path: Path) -> str:
+        """Extract the 8-char hex UUID from a pipeline-generated filename.
+
+        Filenames follow the pattern ``<year>_<name>_<uuid8>.<ext>``.
+        The UUID is the last ``_``-separated segment of the stem.
+
+        Returns:
+            The UUID string (e.g. ``'291afde0'``), or ``''`` if not found.
+        """
+        stem = file_path.stem if isinstance(file_path, Path) else Path(file_path).stem
+        parts = stem.rsplit('_', 1)
+        if len(parts) == 2 and re.fullmatch(r'[0-9a-fA-F]{8}', parts[1]):
+            return parts[1].lower()
+        return ''
+
     def _load_hash_registries(self):
         """Load hashes.xlsx from staging and output into in-memory lookup dicts.
 
         Each dict maps ``file_path`` (as stored in the registry) to
         ``{'md5_hash': ..., 'phash': ...}``.
 
+        A **UUID-based index** is also built for each side so that files
+        can be looked up by their unique 8-char UUID regardless of path
+        differences (trailing dots, separators, etc.).
+
         After loading, a reverse index is built for the **output** side so
         that every staging file can be checked against *all* output files
         by hash, not just against the file at the same relative path.
         """
-        for label, base_dir, target in [
-            ('staging', self.staging_dir, '_staging_hashes'),
-            ('output', self.output_dir, '_output_hashes'),
+        for label, base_dir, target, uuid_target in [
+            ('staging', self.staging_dir, '_staging_hashes', '_staging_uuid_index'),
+            ('output', self.output_dir, '_output_hashes', '_output_uuid_index'),
         ]:
             reg_path = base_dir / self.REGISTRY_DIR / 'hashes.xlsx'
             if not reg_path.exists():
@@ -288,15 +372,22 @@ class OutputMerger:
             try:
                 df = pd.read_excel(reg_path)
                 cache: Dict[str, Dict[str, str]] = {}
+                uuid_idx: Dict[str, Dict[str, str]] = {}
                 for _, row in df.iterrows():
                     fp = str(row.get('file_path', '')) if pd.notna(row.get('file_path')) else ''
                     md5 = str(row.get('md5_hash', '')) if pd.notna(row.get('md5_hash')) else ''
                     phash = str(row.get('phash', '')) if pd.notna(row.get('phash')) else ''
                     uuid_val = str(row.get('uuid', '')) if pd.notna(row.get('uuid')) else ''
+                    entry = {'md5_hash': md5, 'phash': phash, 'uuid': uuid_val}
                     if fp:
-                        cache[fp] = {'md5_hash': md5, 'phash': phash, 'uuid': uuid_val}
+                        cache[fp] = entry
+                    # Index by UUID (primary key for lookups)
+                    if uuid_val:
+                        uuid_idx[uuid_val.lower()] = entry
                 setattr(self, target, cache)
+                setattr(self, uuid_target, uuid_idx)
                 logger.info(f"Loaded {len(cache)} hash entries from {label} hashes.xlsx")
+                logger.info(f"  UUID index: {len(uuid_idx)} entries for {label}")
                 print(f"  Loaded {len(cache)} pre-computed hashes from {label}")
             except Exception as e:
                 logger.warning(f"Failed to load {label} hashes.xlsx: {e}")
@@ -359,45 +450,55 @@ class OutputMerger:
     def _get_file_hashes(self, file_path: Path, side: str) -> Dict[str, str]:
         """Look up md5/phash for a file from the loaded registry. Does not compute.
 
+        The primary lookup is by **UUID** extracted from the filename, which
+        is unique per image and immune to path differences (trailing dots,
+        separator style, relative vs absolute, etc.).  Path-based lookups
+        are kept as fallbacks for files whose UUID cannot be determined.
+
         Args:
             file_path: Absolute path to the file.
             side: ``'staging'`` or ``'output'`` — which registry to check.
 
         Returns:
-            ``{'md5_hash': ..., 'phash': ...}`` (values can be empty strings)
+            ``{'md5_hash': ..., 'phash': ..., 'uuid': ...}`` (values can be empty strings)
         """
+        uuid_idx = self._staging_uuid_index if side == 'staging' else self._output_uuid_index
         cache = self._staging_hashes if side == 'staging' else self._output_hashes
-        
-        # First, try lookup with relative path (more robust)
+
+        def _make_result(entry: Dict[str, str]) -> Dict[str, str]:
+            self.stats['hashes_from_registry'] += 1
+            return {
+                'md5_hash': str(entry.get('md5_hash', '') or ''),
+                'phash': str(entry.get('phash', '') or ''),
+                'uuid': str(entry.get('uuid', '') or ''),
+            }
+
+        # ── 1) Primary: UUID-based lookup ──────────────────────────────
+        file_uuid = self._extract_uuid_from_filename(file_path)
+        if file_uuid and file_uuid in uuid_idx:
+            entry = uuid_idx[file_uuid]
+            if entry.get('md5_hash'):
+                return _make_result(entry)
+
+        # ── 2) Fallback: relative-path lookup ─────────────────────────
         base_dir = self.staging_dir if side == 'staging' else self.output_dir
         try:
-            # Use as_posix() to ensure forward slashes, common in registries
             rel_path_str = file_path.relative_to(base_dir).as_posix()
             if rel_path_str in cache:
                 entry = cache.get(rel_path_str, {})
                 if entry.get('md5_hash'):
-                    self.stats['hashes_from_registry'] += 1
-                    return {
-                        'md5_hash': str(entry.get('md5_hash', '') or ''),
-                        'phash': str(entry.get('phash', '') or ''),
-                        'uuid': str(entry.get('uuid', '') or ''),
-                    }
+                    return _make_result(entry)
         except ValueError:
-            pass  # Not a relative path, that's fine
+            pass
 
-        # Second, try lookup with absolute path as string (original behavior)
+        # ── 3) Fallback: absolute-path lookup ─────────────────────────
         fp_str = str(file_path)
         if fp_str in cache:
             entry = cache.get(fp_str, {})
             if entry.get('md5_hash'):
-                self.stats['hashes_from_registry'] += 1
-                return {
-                    'md5_hash': str(entry.get('md5_hash', '') or ''),
-                    'phash': str(entry.get('phash', '') or ''),
-                    'uuid': str(entry.get('uuid', '') or ''),
-                }
+                return _make_result(entry)
 
-        # Not found in registry — return empty hashes
+        # Not found in any index
         return {'md5_hash': '', 'phash': '', 'uuid': ''}
 
     def _check_missing_hashes(self):
@@ -471,9 +572,12 @@ class OutputMerger:
                 img_hash = self.image_hasher.hash_image(file_path)
                 md5 = img_hash.md5_hash or ''
                 phash = str(img_hash.phash) if img_hash.phash else ''
-                entry = {'md5_hash': md5, 'phash': phash, 'uuid': ''}
+                file_uuid = self._extract_uuid_from_filename(file_path)
+                entry = {'md5_hash': md5, 'phash': phash, 'uuid': file_uuid}
 
-                # Insert into staging cache (both relative and absolute keys)
+                # Insert into staging UUID index (primary) and path caches (fallback)
+                if file_uuid:
+                    self._staging_uuid_index[file_uuid] = entry
                 fp_abs = str(file_path)
                 self._staging_hashes[fp_abs] = entry
                 try:
@@ -773,18 +877,13 @@ class OutputMerger:
                     
                     # Add EXIF year info if campaign_year is in the differences
                     if 'campaign_year' in diffs:
-                        o_year, o_from = self._extract_exif_year_from_paths([str(output_path)])
-                        s_year, s_from = self._extract_exif_year_from_paths([str(staging_path)])
-                        if o_year or s_year:
-                            ctx_info_lines.append("")  # blank line for separation
-                            if o_year:
-                                ctx_info_lines.append(f"EXIF year (existing): {o_year}")
-                            else:
-                                ctx_info_lines.append("EXIF year (existing): (no EXIF found)")
-                            if s_year:
-                                ctx_info_lines.append(f"EXIF year (staging):  {s_year}")
-                            else:
-                                ctx_info_lines.append("EXIF year (staging):  (no EXIF found)")
+                        exif_lines = self._collect_exif_years_from_originals(
+                            existing_original_path=o_orig or '',
+                            staging_original_path=s_orig or '',
+                            existing_file=str(output_path),
+                            staging_file=str(staging_path),
+                        )
+                        ctx_info_lines.extend(exif_lines)
                     # Add match reason and relevant hash/pHash info for debugging
                     try:
                         ctx_info_lines.append("")
@@ -1101,9 +1200,9 @@ class OutputMerger:
         o_hash_md5_map = {}
         phash_threshold = self.image_hasher.phash_threshold
         for _, row in o_hash.iterrows():
-            md5 = str(row.get('md5_hash', ''))
-            phash = str(row.get('phash', ''))
-            uuid = str(row.get('uuid', ''))
+            md5 = str(row.get('md5_hash', '')) if pd.notna(row.get('md5_hash')) else ''
+            phash = str(row.get('phash', '')) if pd.notna(row.get('phash')) else ''
+            uuid = str(row.get('uuid', '')) if pd.notna(row.get('uuid')) else ''
             if md5:
                 o_hash_by_md5[md5].append(uuid)
                 o_hash_md5_map[uuid] = md5
@@ -1126,9 +1225,9 @@ class OutputMerger:
         new_dup_rows = []
 
         for _, s_hash_row in s_hash.iterrows():
-            s_uuid = str(s_hash_row.get('uuid', ''))
-            s_phash = str(s_hash_row.get('phash', ''))
-            s_md5 = str(s_hash_row.get('md5_hash', ''))
+            s_uuid = str(s_hash_row.get('uuid', '')) if pd.notna(s_hash_row.get('uuid')) else ''
+            s_phash = str(s_hash_row.get('phash', '')) if pd.notna(s_hash_row.get('phash')) else ''
+            s_md5 = str(s_hash_row.get('md5_hash', '')) if pd.notna(s_hash_row.get('md5_hash')) else ''
             s_ann_row = s_ann_by_uuid.get(s_uuid)
             if not s_uuid or not s_ann_row:
                 continue
@@ -1195,17 +1294,15 @@ class OutputMerger:
                         f"original_path (existing): {o_row.get('original_path', '')}",
                         f"original_path (staging):  {s_row.get('original_path', '')}",
                         "",
-                        f"Match reason: {match_type} match",
+                        f"Match reason: {match_type} match"
                     ]
-                    # When campaign_year is disputed, show EXIF years to help decide
+                    # Add EXIF year info if campaign_year is in the discrepancies
                     if 'campaign_year' in discrepancies:
-                        o_cur = str(o_row.get('current_path', '')) if pd.notna(o_row.get('current_path')) else ''
-                        s_cur = str(s_row.get('current_path', '')) if pd.notna(s_row.get('current_path')) else ''
-                        o_exif_year, _ = self._extract_exif_year_from_paths([o_cur])
-                        s_exif_year, _ = self._extract_exif_year_from_paths([s_cur])
-                        ctx_lines.append("")
-                        ctx_lines.append(f"EXIF year (existing): {o_exif_year if o_exif_year else 'not available'}")
-                        ctx_lines.append(f"EXIF year (staging):  {s_exif_year if s_exif_year else 'not available'}")
+                        exif_lines = self._collect_exif_years_from_originals(
+                            existing_original_path=str(o_row.get('original_path', '') or ''),
+                            staging_original_path=str(s_row.get('original_path', '') or ''),
+                        )
+                        ctx_lines.extend(exif_lines)
                     table = self._build_comparison_table(discrepancies, f"{match_type} match", context_info=ctx_lines)
                     # Subdir key from original_path
                     orig_path = s_row.get('original_path', '') or o_row.get('original_path', '')

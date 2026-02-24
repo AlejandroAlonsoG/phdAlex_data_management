@@ -81,7 +81,7 @@ class ImageHasher:
     # Default threshold for "near" duplicates (hamming distance)
     # pHash typically uses 64-bit hashes, so max distance is 64
     # Lower = more similar required
-    NEAR_DUPLICATE_THRESHOLD = 8 # TODO sacar esto a un parámetro en condiciones
+    NEAR_DUPLICATE_THRESHOLD = 3 # TODO sacar esto a un parámetro en condiciones
     
     def __init__(self, phash_threshold: int = None, normalize_images: bool = True):
         """
@@ -127,17 +127,15 @@ class ImageHasher:
                 and IMAGEHASH_AVAILABLE
                 and file_path.suffix.lower() in PIL_CONVERTIBLE_EXTENSIONS):
             try:
-                with Image.open(file_path) as img:
-                    if img.mode not in ('RGB', 'L'):
-                        img = img.convert('RGB')
-                    elif img.mode == 'L':
-                        img = img.convert('RGB')
+                img = self._open_image(file_path)
+                if img is not None:
                     buf = io.BytesIO()
                     img.save(buf, format='JPEG', quality=JPEG_QUALITY)
                     return hashlib.md5(buf.getvalue()).hexdigest()
+                # _open_image returned None → fall through to raw-bytes MD5
             except Exception as e:
                 logger.debug(
-                    f"PIL could not normalise {file_path.name}, "
+                    f"Could not normalise {file_path.name}, "
                     f"falling back to file-bytes MD5: {e}"
                 )
 
@@ -152,9 +150,56 @@ class ImageHasher:
             logger.error(f"Error computing MD5 for {file_path}: {e}")
             return ""
     
+    # RAW extensions that PIL cannot open but rawpy can decode
+    _RAW_EXTENSIONS = {'.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2', '.raw'}
+
+    def _open_image(self, file_path: Path) -> Optional[Image.Image]:
+        """Open an image file, using rawpy as fallback for RAW formats.
+
+        Returns a PIL Image in RGB mode, or None if the file cannot be opened.
+        """
+        # --- Try PIL first (fast, handles most formats) ---
+        try:
+            img = Image.open(file_path)
+            img.load()  # Force decompression
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            elif img.mode == 'L':
+                img = img.convert('RGB')
+            return img
+        except Exception as pil_err:
+            logger.debug(
+                f"PIL could not open {file_path.name}: {pil_err}"
+            )
+
+        # --- Fallback: rawpy for RAW camera formats ---
+        if file_path.suffix.lower() in self._RAW_EXTENSIONS:
+            try:
+                import rawpy
+                with rawpy.imread(str(file_path)) as raw:
+                    rgb = raw.postprocess(use_camera_wb=True)
+                img = Image.fromarray(rgb)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                return img
+            except ImportError:
+                logger.debug(
+                    f"rawpy not installed — cannot decode {file_path.name}. "
+                    f"Install with: pip install rawpy"
+                )
+            except Exception as raw_err:
+                logger.warning(
+                    f"rawpy could not decode {file_path.name}: {raw_err}"
+                )
+
+        return None
+
     def compute_phash(self, file_path: Path) -> Optional[str]:
         """
         Compute perceptual hash (pHash) of an image.
+
+        Attempts PIL first, then rawpy for RAW camera formats
+        (.orf, .nef, .cr2, etc.).
         
         Args:
             file_path: Path to image file
@@ -169,20 +214,13 @@ class ImageHasher:
         if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
             return None
         
+        img = self._open_image(file_path)
+        if img is None:
+            return None
+
         try:
-            with Image.open(file_path) as img:
-                # PSD files: Pillow only reads the flattened composite.
-                # Force-load so any decompression error surfaces here.
-                img.load()
-                
-                # Convert to RGB if necessary (handles RGBA, P, LA, CMYK, etc.)
-                if img.mode not in ('RGB', 'L'):
-                    img = img.convert('RGB')
-                
-                # Compute perceptual hash
-                phash = imagehash.phash(img)
-                return str(phash)
-                
+            phash = imagehash.phash(img)
+            return str(phash)
         except Exception as e:
             logger.warning(
                 f"Error computing pHash for {file_path.name} "
