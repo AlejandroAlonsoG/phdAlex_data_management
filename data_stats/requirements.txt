@@ -1,0 +1,4 @@
+pandas>=1.5
+openpyxl>=3.0
+plotly>=5.15
+kaleido>=0.2
