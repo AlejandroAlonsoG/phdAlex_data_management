@@ -34,6 +34,7 @@ import pandas as pd
 
 from .image_hasher import ImageHasher, DuplicateType
 from .config import IMAGE_EXTENSIONS
+from .path_utils import to_relative, to_absolute
 from .main_orchestrator import PipelineOrchestrator
 from .interaction_manager import (
     InteractionManager, InteractionMode, DecisionType, DecisionOutcome,
@@ -222,7 +223,20 @@ class OutputMerger:
                 if not os.path.exists(pstr):
                     continue
                 with Image.open(pstr) as im:
-                    exif = im._getexif() or {}
+                    exif = {}
+                    # Try public API first (works for all formats)
+                    try:
+                        exif_data = im.getexif()
+                        if exif_data:
+                            exif = dict(exif_data)
+                    except Exception:
+                        pass
+                    # Fallback to private JPEG-specific API
+                    if not exif:
+                        try:
+                            exif = im._getexif() or {}
+                        except (AttributeError, Exception):
+                            pass
                 if not exif:
                     continue
                 # Prefer DateTimeOriginal or DateTime tag
@@ -261,10 +275,11 @@ class OutputMerger:
             Current (renamed) file paths, used as fallback when original paths
             are unavailable.
 
-        Returns a list of human-readable lines such as:
+        Returns a list of human-readable lines such as::
+
             EXIF years from original files:
-              [existing] D:\...\IMG001.ORF  →  2009
-              [staging]  D:\...\IMG002.ORF  →  2011
+              [existing] D:\\...\\IMG001.ORF  →  2009
+              [staging]  D:\\...\\IMG002.ORF  →  2011
         """
         lines: List[str] = []
         entries: List[tuple] = []  # (label, path_str)
@@ -275,8 +290,11 @@ class OutputMerger:
                 p = p.strip()
                 if p:
                     entries.append(('existing', p))
-        if existing_file and not existing_original_path:
-            entries.append(('existing', existing_file))
+        # Always add current file as fallback (original may be on disconnected drive)
+        if existing_file:
+            existing_file_str = str(existing_file).strip()
+            if existing_file_str and existing_file_str not in [e[1] for e in entries]:
+                entries.append(('existing', existing_file_str))
 
         # Collect staging paths
         if staging_original_path:
@@ -284,8 +302,11 @@ class OutputMerger:
                 p = p.strip()
                 if p:
                     entries.append(('staging', p))
-        if staging_file and not staging_original_path:
-            entries.append(('staging', staging_file))
+        # Always add current file as fallback
+        if staging_file:
+            staging_file_str = str(staging_file).strip()
+            if staging_file_str and staging_file_str not in [e[1] for e in entries]:
+                entries.append(('staging', staging_file_str))
 
         if not entries:
             return lines
@@ -678,7 +699,9 @@ class OutputMerger:
                     dup_dir.mkdir(parents=True, exist_ok=True)
 
                 # Attempt to extract campaign year from staging or output EXIF
-                year, _ = self._extract_exif_year_from_paths([str(staging_path), str(matched_path)])
+                # matched_path is a relative path from the hash index — resolve to absolute for EXIF
+                matched_abs = str(to_absolute(matched_path, self.output_dir))
+                year, _ = self._extract_exif_year_from_paths([str(staging_path), matched_abs])
 
                 # Generate a new filename and ensure uniqueness
                 new_name = self._generate_new_filename(staging_path, campaign_year=year, specimen_id=None)
@@ -708,14 +731,18 @@ class OutputMerger:
                             # non-image: raw copy
                             shutil.copy2(staging_path, dest_path)
                             final_dest = dest_path
-                        # Update in-memory output hashes and indexes so future checks see it
-                        self._output_hashes[str(final_dest)] = {'md5_hash': s_md5, 'phash': s_phash}
+                        # Update in-memory output hashes and indexes with relative paths
+                        rel_final = to_relative(final_dest, self.output_dir)
+                        self._output_hashes[rel_final] = {'md5_hash': s_md5, 'phash': s_phash}
                         if s_md5:
-                            self._output_md5_index.setdefault(s_md5, []).append(str(final_dest))
+                            self._output_md5_index.setdefault(s_md5, []).append(rel_final)
                         if s_phash:
-                            self._output_phash_index.setdefault(s_phash, []).append(str(final_dest))
+                            self._output_phash_index.setdefault(s_phash, []).append(rel_final)
                         # Record mapping so registry updater can point to the copied duplicate
+                        # Keys: both absolute staging path and relative-to-staging for lookup flexibility
+                        rel_staging = to_relative(staging_path, self.staging_dir)
                         self._copied_duplicates[str(staging_path)] = str(final_dest)
+                        self._copied_duplicates[rel_staging] = str(final_dest)
                         logger.info(f"Copied duplicate to: {final_dest}")
                         self.stats['files_copied'] += 1
                 except Exception as e:
@@ -893,13 +920,17 @@ class OutputMerger:
                         o_src = 'computed'
                         try:
                             sp = str(staging_path)
-                            if sp in self._staging_hashes and self._staging_hashes[sp].get('md5_hash'):
+                            sp_rel = to_relative(staging_path, self.staging_dir)
+                            if ((sp in self._staging_hashes and self._staging_hashes[sp].get('md5_hash'))
+                                    or (sp_rel in self._staging_hashes and self._staging_hashes[sp_rel].get('md5_hash'))):
                                 s_src = 'staging registry'
                         except Exception:
                             pass
                         try:
                             op = str(output_path)
-                            if op in self._output_hashes and self._output_hashes[op].get('md5_hash'):
+                            op_rel = to_relative(output_path, self.output_dir)
+                            if ((op in self._output_hashes and self._output_hashes[op].get('md5_hash'))
+                                    or (op_rel in self._output_hashes and self._output_hashes[op_rel].get('md5_hash'))):
                                 o_src = 'output registry'
                         except Exception:
                             pass
@@ -1185,6 +1216,18 @@ class OutputMerger:
             print("  Staging anotaciones.xlsx or hashes.xlsx is missing/empty. Skipping merge.")
             return
 
+        # Cast text columns to object so that pandas doesn't reject string
+        # assignments into columns it inferred as float64 (all-NaN).
+        _text_cols = {
+            'uuid', 'specimen_id', 'original_path', 'current_path',
+            'macroclass_label', 'class_label', 'genera_label',
+            'fuente', 'comentarios', 'file_path',
+        }
+        for df in [s_ann, s_hash, o_ann, o_hash, o_dup]:
+            for col in _text_cols:
+                if col in df.columns:
+                    df[col] = df[col].astype(object)
+
         # Prepare lookups
         for df in [s_ann, s_hash, o_ann, o_hash]:
             if 'uuid' in df.columns:
@@ -1283,6 +1326,13 @@ class OutputMerger:
                         rows_auto_merged += 1
                     elif o_str and not s_str:
                         pass
+                    elif col == 'comentarios':
+                        # Auto-resolve comments: keep the longest one
+                        if len(s_str) > len(o_str):
+                            if not self.dry_run:
+                                output_ann_copy.loc[output_ann_copy['uuid'] == match_uuid, col] = s_val
+                            rows_auto_merged += 1
+                        # else keep existing (longer or equal)
                     else:
                         discrepancies[col] = {'staging': s_str, 'output': o_str}
 
@@ -1298,9 +1348,16 @@ class OutputMerger:
                     ]
                     # Add EXIF year info if campaign_year is in the discrepancies
                     if 'campaign_year' in discrepancies:
+                        # current_path may be relative — resolve to absolute for EXIF reading
+                        o_cur = str(o_row.get('current_path', '') or '')
+                        s_cur = str(s_row.get('current_path', '') or '')
+                        o_file_abs = str(to_absolute(o_cur, self.output_dir)) if o_cur else ''
+                        s_file_abs = str(to_absolute(s_cur, self.staging_dir)) if s_cur else ''
                         exif_lines = self._collect_exif_years_from_originals(
                             existing_original_path=str(o_row.get('original_path', '') or ''),
                             staging_original_path=str(s_row.get('original_path', '') or ''),
+                            existing_file=o_file_abs,
+                            staging_file=s_file_abs,
                         )
                         ctx_lines.extend(exif_lines)
                     table = self._build_comparison_table(discrepancies, f"{match_type} match", context_info=ctx_lines)
@@ -1309,8 +1366,13 @@ class OutputMerger:
                     subdir_key = self._extract_subdir_key(orig_path)
                     cached = self._subdir_merge_choices.get(subdir_key)
                     choice = None
+                    custom_values = None
                     if cached is not None:
-                        choice = cached
+                        if isinstance(cached, tuple) and cached[0] == 'custom':
+                            choice = 2
+                            custom_values = cached[1]
+                        else:
+                            choice = int(cached) if cached is not None else 0
                     else:
                         decision_request = create_merge_registry_conflict_decision(
                             registry_name='anotaciones.xlsx',
@@ -1319,16 +1381,53 @@ class OutputMerger:
                             context_info={}
                         )
                         result = self.interaction_manager.request_decision(decision_request)
-                        if result.outcome == DecisionOutcome.APPLY_TO_SUBDIRECTORY:
-                            sel = result.selected_option if result.selected_option is not None else 0
-                            self._subdir_merge_choices[subdir_key] = sel
-                            choice = sel
+                        if result.outcome == DecisionOutcome.DEFER:
+                            choice = -1
+                        elif result.outcome == DecisionOutcome.APPLY_TO_SUBDIRECTORY:
+                            if result.selected_option is not None:
+                                sel = int(result.selected_option)
+                                if sel == 2:
+                                    # Custom per-field with apply to subdirectory
+                                    custom_values = self._prompt_custom_per_field(discrepancies)
+                                    if subdir_key:
+                                        self._subdir_merge_choices[subdir_key] = ('custom', custom_values)
+                                    choice = 2
+                                else:
+                                    if subdir_key:
+                                        self._subdir_merge_choices[subdir_key] = sel
+                                    choice = sel
+                            elif result.custom_value:
+                                custom_values = self._prompt_custom_per_field(discrepancies)
+                                if subdir_key:
+                                    self._subdir_merge_choices[subdir_key] = ('custom', custom_values)
+                                choice = 2
+                            else:
+                                choice = 0
+                        elif result.outcome == DecisionOutcome.CUSTOM:
+                            # User pressed 'c' — prompt per-field
+                            custom_values = self._prompt_custom_per_field(discrepancies)
+                            choice = 2
                         else:
-                            choice = result.selected_option if result.selected_option is not None else 0
+                            sel = int(result.selected_option) if result.selected_option is not None else 0
+                            if sel == 2:
+                                # Option 3 selected: custom per-field
+                                custom_values = self._prompt_custom_per_field(discrepancies)
+                                choice = 2
+                            elif sel == 3:
+                                # Option 4 selected: defer
+                                choice = -1
+                            else:
+                                choice = sel
                     if choice == 1:
                         for col in discrepancies:
                             if not self.dry_run:
                                 output_ann_copy.loc[output_ann_copy['uuid'] == match_uuid, col] = s_row[col]
+                        conflicts_resolved += 1
+                        self.stats['registry_conflicts'] += 1
+                    elif choice == 2 and custom_values:
+                        for col, val in custom_values.items():
+                            if not self.dry_run:
+                                output_ann_copy.loc[output_ann_copy['uuid'] == match_uuid, col] = val
                         conflicts_resolved += 1
                         self.stats['registry_conflicts'] += 1
 
@@ -1402,6 +1501,42 @@ class OutputMerger:
         print(f"    New records appended: {len(new_ann_rows)}")
         if rows_auto_merged: print(f"    Fields auto-merged (gap-fill): {rows_auto_merged}")
         if conflicts_resolved: print(f"    Conflicts resolved: {conflicts_resolved}")
+
+    # ------------------------------------------------------------------
+    # Per-field custom value prompting
+    # ------------------------------------------------------------------
+
+    def _prompt_custom_per_field(
+        self,
+        discrepancies: Dict[str, Dict[str, str]],
+    ) -> Dict[str, str]:
+        """Prompt the user for a custom value for each discrepant field.
+
+        For each field shows the existing (output) and staging values and
+        asks the user to pick one or type a custom value.
+
+        Returns:
+            Dict mapping column name → chosen value.
+        """
+        custom_values: Dict[str, str] = {}
+        if self.interaction_manager.mode == InteractionMode.AUTO_ACCEPT:
+            # Auto mode: keep existing for all fields
+            for col, d in discrepancies.items():
+                custom_values[col] = d['output']
+            return custom_values
+
+        for col, d in discrepancies.items():
+            print(f"\n  {col}:  [0] existing = '{d['output']}'  |  [1] staging = '{d['staging']}'")
+            val = input(f"  Enter value for '{col}' (or 0/1 to pick): ").strip()
+            if val == '0':
+                custom_values[col] = d['output']
+            elif val == '1':
+                custom_values[col] = d['staging']
+            elif val:
+                custom_values[col] = val
+            else:
+                custom_values[col] = d['output']  # default: keep existing
+        return custom_values
 
     # ------------------------------------------------------------------
     # Merge conflict UI  ([0] existing / [1] staging / [2] custom / [d] defer)
@@ -1562,6 +1697,17 @@ class OutputMerger:
             Merged DataFrame, or None if no changes
         """
 
+        # Cast text columns to object to avoid float64 vs string conflicts
+        _text_cols = {
+            'uuid', 'specimen_id', 'original_path', 'current_path',
+            'macroclass_label', 'class_label', 'genera_label',
+            'fuente', 'comentarios', 'file_path',
+        }
+        for df in [staging_df, output_df]:
+            for col in _text_cols:
+                if col in df.columns:
+                    df[col] = df[col].astype(object)
+
         # --- Pick the first usable match column ---
         key_col: Optional[str] = None
         for col in match_cols:
@@ -1641,6 +1787,13 @@ class OutputMerger:
                     elif o_str and not s_str:
                         # Output has data, staging empty → keep output
                         pass
+                    elif col == 'comentarios':
+                        # Auto-resolve comments: keep the longest one
+                        if len(s_str) > len(o_str):
+                            if not self.dry_run:
+                                output_df.at[output_idx, col] = s_val
+                            rows_updated += 1
+                        # else keep existing (longer or equal)
                     else:
                         discrepancies[col] = {
                             'staging': s_str,
@@ -1681,8 +1834,13 @@ class OutputMerger:
                 s_year = None
                 s_from = None
                 if 'campaign_year' in discrepancies:
-                    o_candidates = [p for p in (o_orig, str(output_row.get('current_path', ''))) if p]
-                    s_candidates = [p for p in (s_orig, str(staging_row.get('current_path', ''))) if p]
+                    o_cur = str(output_row.get('current_path', ''))
+                    s_cur = str(staging_row.get('current_path', ''))
+                    # Resolve current_path (may be relative) to absolute for EXIF reading
+                    o_cur_abs = str(to_absolute(o_cur, self.output_dir)) if o_cur else ''
+                    s_cur_abs = str(to_absolute(s_cur, self.staging_dir)) if s_cur else ''
+                    o_candidates = [p for p in (o_orig, o_cur_abs) if p]
+                    s_candidates = [p for p in (s_orig, s_cur_abs) if p]
                     o_year, o_from = self._extract_exif_year_from_paths(o_candidates)
                     s_year, s_from = self._extract_exif_year_from_paths(s_candidates)
                     ctx_lines.append("")
@@ -1729,31 +1887,38 @@ class OutputMerger:
                     elif result.outcome == DecisionOutcome.APPLY_TO_SUBDIRECTORY:
                         if result.selected_option is not None:
                             sel = int(result.selected_option)
-                            if subdir_key:
-                                self._subdir_merge_choices[subdir_key] = sel
-                            choice = sel
+                            if sel == 2:
+                                # Custom per-field with apply to subdirectory
+                                custom_values = self._prompt_custom_per_field(discrepancies)
+                                if subdir_key:
+                                    self._subdir_merge_choices[subdir_key] = ('custom', custom_values)
+                                choice = 2
+                            else:
+                                if subdir_key:
+                                    self._subdir_merge_choices[subdir_key] = sel
+                                choice = sel
                         elif result.custom_value:
-                            cv = {}
-                            for part in str(result.custom_value).split(';'):
-                                if '=' in part:
-                                    k, v = part.split('=', 1)
-                                    cv[k.strip()] = v.strip()
+                            custom_values = self._prompt_custom_per_field(discrepancies)
                             if subdir_key:
-                                self._subdir_merge_choices[subdir_key] = ('custom', cv)
+                                self._subdir_merge_choices[subdir_key] = ('custom', custom_values)
                             choice = 2
-                            custom_values = cv
                         else:
                             choice = 0
                     elif result.outcome == DecisionOutcome.CUSTOM:
-                        cv = {}
-                        for part in str(result.custom_value).split(';'):
-                            if '=' in part:
-                                k, v = part.split('=', 1)
-                                cv[k.strip()] = v.strip()
+                        # User pressed 'c' — prompt per-field
+                        custom_values = self._prompt_custom_per_field(discrepancies)
                         choice = 2
-                        custom_values = cv
                     else:
-                        choice = int(result.selected_option) if result.selected_option is not None else 0
+                        sel = int(result.selected_option) if result.selected_option is not None else 0
+                        if sel == 2:
+                            # Option 3 selected: custom per-field
+                            custom_values = self._prompt_custom_per_field(discrepancies)
+                            choice = 2
+                        elif sel == 3:
+                            # Option 4 selected: defer
+                            choice = -1
+                        else:
+                            choice = sel
 
                 if choice == 1:
                     for col in discrepancies:
@@ -1787,12 +1952,13 @@ class OutputMerger:
     
     def _update_registry_paths(self):
         """
-        Update file paths in registries to reflect the final output directory.
+        Update file paths in registries to be relative to the output directory.
         
-        After merge, the 'current_path' fields in registries still reference
-        the staging directory. This updates them to point to the output directory.
+        After merge, the 'current_path' and 'file_path' fields in registries
+        may reference the staging directory or be absolute paths. This converts
+        them all to relative paths w.r.t. the output directory.
         """
-        print("\n--- Updating Registry Paths ---")
+        print("\n--- Updating Registry Paths (converting to relative) ---")
         
         output_reg_dir = self.output_dir / self.REGISTRY_DIR
         if not output_reg_dir.exists():
@@ -1813,26 +1979,38 @@ class OutputMerger:
                 updated = False
                 
                 for col in path_columns:
-                    if col in df.columns:
-                        mask = df[col].astype(str).str.startswith(staging_str)
-                        if mask.any():
-                            df.loc[mask, col] = df.loc[mask, col].astype(str).str.replace(
-                                staging_str, output_str, n=1
-                            )
-                            updated = True
-                            count = mask.sum()
-                            print(f"  {registry_file}: Updated {count} paths in '{col}'")
-
-                # Apply exact mappings for any duplicates we copied into Duplicados
-                if self._copied_duplicates:
-                    for col in path_columns:
-                        if col in df.columns:
-                            for src, dst in self._copied_duplicates.items():
-                                exact_mask = df[col].astype(str) == src
-                                if exact_mask.any():
-                                    df.loc[exact_mask, col] = dst
-                                    updated = True
-                                    print(f"  {registry_file}: Rewrote {exact_mask.sum()} exact paths in '{col}' to copied duplicates")
+                    if col not in df.columns:
+                        continue
+                    
+                    original_values = df[col].astype(str).copy()
+                    new_values = original_values.copy()
+                    
+                    for idx, val in original_values.items():
+                        if not val or val == 'nan':
+                            continue
+                        # First, normalise staging paths to output paths
+                        normalised = val
+                        if normalised.startswith(staging_str):
+                            normalised = normalised.replace(staging_str, output_str, 1)
+                        
+                        # Apply exact mappings for copied duplicates
+                        # Try the value as-is, as absolute-staging, and as relative-to-staging
+                        dup_dest = (
+                            self._copied_duplicates.get(val)
+                            or self._copied_duplicates.get(str(to_absolute(val, self.staging_dir)))
+                            or self._copied_duplicates.get(str(to_absolute(val, self.output_dir)))
+                        )
+                        if dup_dest:
+                            normalised = dup_dest
+                        
+                        # Convert to relative
+                        new_values.at[idx] = to_relative(normalised, self.output_dir)
+                    
+                    if not new_values.equals(original_values):
+                        df[col] = new_values
+                        updated = True
+                        count = (new_values != original_values).sum()
+                        print(f"  {registry_file}: Converted {count} paths to relative in '{col}'")
                 
                 if updated and not self.dry_run:
                     df.to_excel(reg_path, index=False)
@@ -1840,6 +2018,42 @@ class OutputMerger:
             except Exception as e:
                 logger.error(f"Failed to update paths in {registry_file}: {e}")
                 print(f"  ERROR updating {registry_file}: {e}")
+        
+        # Also update the duplicados_registro.xlsx paths
+        dup_reg_path = self.output_dir / 'Duplicados' / 'duplicados_registro.xlsx'
+        if dup_reg_path.exists():
+            try:
+                df = pd.read_excel(dup_reg_path)
+                updated = False
+                for col in path_columns:
+                    if col not in df.columns:
+                        continue
+                    original_values = df[col].astype(str).copy()
+                    new_values = original_values.copy()
+                    for idx, val in original_values.items():
+                        if not val or val == 'nan':
+                            continue
+                        normalised = val
+                        if normalised.startswith(staging_str):
+                            normalised = normalised.replace(staging_str, output_str, 1)
+                        dup_dest = (
+                            self._copied_duplicates.get(val)
+                            or self._copied_duplicates.get(str(to_absolute(val, self.staging_dir)))
+                            or self._copied_duplicates.get(str(to_absolute(val, self.output_dir)))
+                        )
+                        if dup_dest:
+                            normalised = dup_dest
+                        new_values.at[idx] = to_relative(normalised, self.output_dir)
+                    if not new_values.equals(original_values):
+                        df[col] = new_values
+                        updated = True
+                        count = (new_values != original_values).sum()
+                        print(f"  duplicados_registro.xlsx: Converted {count} paths to relative in '{col}'")
+                if updated and not self.dry_run:
+                    df.to_excel(dup_reg_path, index=False)
+            except Exception as e:
+                logger.error(f"Failed to update paths in duplicados_registro.xlsx: {e}")
+                print(f"  ERROR updating duplicados_registro.xlsx: {e}")
     
     def merge(self) -> Dict[str, int]:
         """

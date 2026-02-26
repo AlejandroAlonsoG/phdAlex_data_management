@@ -17,6 +17,7 @@ from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import config, detect_collection, COLLECTIONS, get_macroclass_folder
+from .path_utils import to_relative, to_absolute, ensure_relative
 from .logger_module import DataOrderingLogger, LogAction
 from .excel_manager import ExcelManager, ImageRecord, TextFileRecord, OtherFileRecord
 from .file_utils import DirectoryWalker, FileClassifier, FileType, FileInfo
@@ -2259,7 +2260,7 @@ class PipelineOrchestrator:
                     counter += 1
                 new_filename = dest_path.name
             
-            pf_data['destination_path'] = str(dest_path)
+            pf_data['destination_path'] = to_relative(dest_path, self.output_dir)
             pf_data['new_filename'] = new_filename
             
             # Log destination decision with reasoning
@@ -2278,18 +2279,20 @@ class PipelineOrchestrator:
             )
             
             # Move/copy file (convert images to .jpg when possible)
+            # dest_path is relative; resolve to absolute for actual I/O
+            abs_dest_path = to_absolute(pf_data['destination_path'], self.output_dir)
             if not self.dry_run:
                 try:
-                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    abs_dest_path.parent.mkdir(parents=True, exist_ok=True)
                     converted = False
                     if file_type == FileType.IMAGE:
-                        converted = self._copy_as_jpeg(source_path, dest_path)
+                        converted = self._copy_as_jpeg(source_path, abs_dest_path)
                     if not converted:
-                        shutil.copy2(source_path, dest_path)
+                        shutil.copy2(source_path, abs_dest_path)
                     pf_data['moved'] = True
                     
                     # Log the action
-                    self.action_logger.file_copied(source_path, dest_path)
+                    self.action_logger.file_copied(source_path, abs_dest_path)
                 except Exception as e:
                     logger.warning(f"Failed to copy {source_path}: {e}")
                     self.action_logger.error(f"Failed to copy {source_path}", e)
@@ -2384,11 +2387,13 @@ class PipelineOrchestrator:
                     file_uuid = pf_data.get('file_uuid') or ImageRecord.generate_uuid()
                     md5 = pf_data.get('md5_hash', '')
                     phash = pf_data.get('phash', '')
+                    # Store file_path as relative to output_dir
+                    hash_file_path = pf_data.get('destination_path') or to_relative(path_str, self.output_dir)
                     excel_manager.add_hash(
                         uuid=file_uuid,
                         md5_hash=md5,
                         phash=phash,
-                        file_path=Path(pf_data.get('destination_path') or path_str),
+                        file_path=Path(hash_file_path),
                     )
 
                 # --- Check if duplicate ---
@@ -2402,7 +2407,7 @@ class PipelineOrchestrator:
                         uuid=pf_data.get('file_uuid'),
                         specimen_id=pf_data.get('specimen_id'),
                         original_path=path_str,
-                        current_path=pf_data.get('destination_path'),
+                        current_path=pf_data.get('destination_path'),  # already relative
                         macroclass_label=pf_data.get('macroclass') or get_macroclass_folder(pf_data.get('taxonomic_class')),
                         class_label=pf_data.get('taxonomic_class'),
                         genera_label=pf_data.get('determination'),
@@ -2444,7 +2449,7 @@ class PipelineOrchestrator:
                     uuid=pf_data.get('file_uuid'),
                     specimen_id=pf_data.get('specimen_id'),
                     original_path=combined_original_path,
-                    current_path=pf_data.get('destination_path'),
+                    current_path=pf_data.get('destination_path'),  # already relative
                     macroclass_label=macroclass,
                     class_label=pf_data.get('taxonomic_class'),
                     genera_label=pf_data.get('determination'),
@@ -2461,15 +2466,16 @@ class PipelineOrchestrator:
 
             elif file_type == FileType.TEXT:
                 original_path = Path(path_str)
-                current_path = Path(pf_data.get('destination_path') or path_str)
-                excel_manager.add_text_file(original_path, current_path)
+                # current_path stored as relative (destination_path is already relative)
+                current_path_str = pf_data.get('destination_path') or to_relative(path_str, self.output_dir)
+                excel_manager.add_text_file(original_path, Path(current_path_str))
                 text_count += 1
                 self.action_logger.registry_entry("text", pf_data.get('filename', ''))
                 
             else:
                 original_path = Path(path_str)
-                current_path = Path(pf_data.get('destination_path') or path_str)
-                excel_manager.add_other_file(original_path, current_path)
+                current_path_str = pf_data.get('destination_path') or to_relative(path_str, self.output_dir)
+                excel_manager.add_other_file(original_path, Path(current_path_str))
                 other_count += 1
                 self.action_logger.registry_entry("other", pf_data.get('filename', ''))
         
