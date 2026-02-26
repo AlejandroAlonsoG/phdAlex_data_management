@@ -1,0 +1,5 @@
+Pillow>=9.0
+pandas>=1.5
+openpyxl>=3.0
+# Optional: rawpy (for RAW camera format support: .orf, .nef, .cr2, etc.)
+# pip install rawpy
