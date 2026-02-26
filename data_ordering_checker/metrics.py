@@ -6,6 +6,8 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 import pandas as pd
 
+from data_ordering.config import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
+
 
 class MetricsCollector:
     """
@@ -164,11 +166,8 @@ class MetricsCollector:
         if not duplicados_dir.exists():
             return stats
         
-        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
-        text_extensions = {
-            '.txt', '.csv', '.md', '.json', '.pdf', '.doc', '.docx',
-            '.rtf', '.odt', '.xml', '.yaml', '.yml', '.tsv'
-        }
+        image_extensions = IMAGE_EXTENSIONS
+        text_extensions = TEXT_EXTENSIONS
         
         for file_path in duplicados_dir.rglob('*'):
             if file_path.is_file():

@@ -10,6 +10,7 @@ import hashlib
 from collections import defaultdict
 
 from .metrics import MetricsCollector
+from data_ordering.config import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
 
 
 @dataclass
@@ -141,12 +142,9 @@ class DataOrderingChecker:
         """
         metrics = FileCountMetrics()
         
-        # Image extensions
-        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
-        text_extensions = {
-            '.txt', '.csv', '.md', '.json', '.pdf', '.doc', '.docx',
-            '.rtf', '.odt', '.xml', '.yaml', '.yml', '.tsv'
-        }
+        # Use the same extension sets as data_ordering
+        image_extensions = IMAGE_EXTENSIONS
+        text_extensions = TEXT_EXTENSIONS
         
         # Check for Duplicados folder (Spanish name used by data_ordering)
         duplicados_dir = self.output_dir / "Duplicados"
@@ -771,6 +769,7 @@ class DataOrderingChecker:
             return all_uuids
 
         source_hashes_list = []
+        source_hashes_only_list = []
         source_entries = {}
         for sd in source_dirs:
             hashes = _load_hashes_from(sd)
@@ -779,9 +778,10 @@ class DataOrderingChecker:
             text_df = DataOrderingChecker._load_registry(Path(sd) / 'registries' / 'archivos_texto.xlsx')
             other_df = DataOrderingChecker._load_registry(Path(sd) / 'registries' / 'archivos_otros.xlsx')
             dup_df = DataOrderingChecker._load_registry(Path(sd) / 'Duplicados' / 'duplicados_registro.xlsx')
+            hashes_df = DataOrderingChecker._load_registry(Path(sd) / 'registries' / 'hashes.xlsx')
 
             entry = {
-                'hashes_count': len(hashes) if hashes is not None else None,
+                'hashes_count': len(hashes_df) if hashes_df is not None else None,
                 'main_registry_count': len(main_df) if main_df is not None else 0,
                 'duplicate_registry_count': len(dup_df) if dup_df is not None else 0,
                 'text_registry_count': len(text_df) if text_df is not None else 0,
@@ -800,13 +800,24 @@ class DataOrderingChecker:
                 except Exception:
                     pass
 
+            # Collect hashes-only UUIDs (from hashes.xlsx) for count comparison
+            hashes_only_uuids: Set[str] = set()
+            if hashes_df is not None and 'uuid' in hashes_df.columns:
+                hashes_only_uuids = set(hashes_df['uuid'].dropna().astype(str).str.strip().values)
+            source_hashes_only_list.append(hashes_only_uuids)
+
             source_hashes_list.append(hashes if hashes is not None else set())
             source_entries[str(sd)] = entry
 
-        # Union of source unique hashes
+        # Union of ALL source UUIDs (hashes + duplicates) for set-difference checks
         union_hashes: Set[str] = set()
         for s in source_hashes_list:
             union_hashes.update(s)
+
+        # Union of hashes-only UUIDs for count comparison
+        union_hashes_only: Set[str] = set()
+        for s in source_hashes_only_list:
+            union_hashes_only.update(s)
 
         # Load merged hashes
         merged_hashes = _load_hashes_from(merged_dir)
@@ -818,7 +829,7 @@ class DataOrderingChecker:
         # Prepare comparison
         result = {
             'sources': source_entries,
-            'source_unique_hashes_count': len(union_hashes),
+            'source_unique_hashes_count': len(union_hashes_only),
             'merged_hashes_count': len(merged_hashes) if merged_hashes is not None else None,
             'merged_duplicate_count': len(merged_duplicate_df) if merged_duplicate_df is not None else 0,
             'missing_in_merged': [],
@@ -855,13 +866,14 @@ class DataOrderingChecker:
         merged_text_df = DataOrderingChecker._load_registry(merged_dir / 'registries' / 'archivos_texto.xlsx')
         merged_other_df = DataOrderingChecker._load_registry(merged_dir / 'registries' / 'archivos_otros.xlsx')
         merged_dup_df = DataOrderingChecker._load_registry(merged_dir / 'Duplicados' / 'duplicados_registro.xlsx')
+        merged_hashes_df = DataOrderingChecker._load_registry(merged_dir / 'registries' / 'hashes.xlsx')
 
         result['merged_summary'] = {
             'main_registry_count': len(merged_main_df) if merged_main_df is not None else 0,
             'duplicate_registry_count': len(merged_dup_df) if merged_dup_df is not None else 0,
             'text_registry_count': len(merged_text_df) if merged_text_df is not None else 0,
             'other_registry_count': len(merged_other_df) if merged_other_df is not None else 0,
-            'hashes_count': len(merged_hashes) if merged_hashes is not None else None,
+            'hashes_count': len(merged_hashes_df) if merged_hashes_df is not None else None,
         }
 
         # Compute totals across sources (main + duplicates) for comparison
@@ -882,19 +894,17 @@ class DataOrderingChecker:
         merged_main = result['merged_summary']['main_registry_count']
         merged_dup = result['merged_summary']['duplicate_registry_count']
 
-        # Hash count validation: differences only acceptable if duplicates exist
-        sum_source_hashes = sum(
-            v.get('hashes_count', 0) or 0 for v in source_entries.values()
-        )
+        # Hash count validation: compare unique union of source hashes vs merged
+        source_unique_hash_count = result['source_unique_hashes_count']
         merged_hash_count = result['merged_summary'].get('hashes_count') or 0
-        hashes_differ = sum_source_hashes != merged_hash_count
+        hashes_differ = source_unique_hash_count != merged_hash_count
         has_merged_duplicates = merged_dup > 0
 
         result['merge_totals_comparison'] = {
             'merged_main_plus_duplicates': merged_main + merged_dup,
             'sources_main_plus_duplicates': result['sources_totals']['sum_main_plus_duplicates'],
             'equal_totals': (merged_main + merged_dup) == result['sources_totals']['sum_main_plus_duplicates'],
-            'sum_source_hashes': sum_source_hashes,
+            'source_unique_hashes': source_unique_hash_count,
             'merged_hashes': merged_hash_count,
             'hashes_differ': hashes_differ,
             'hash_difference_justified': not hashes_differ or has_merged_duplicates,
